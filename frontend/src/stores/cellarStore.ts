@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { createId, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { useSyncGuard } from '@/hooks/useSyncGuard'
 import {
   CELLAR_NEAR_DAYS,
   CELLAR_STATE_FLOW,
@@ -15,6 +16,7 @@ import {
 } from '@/types/cellar'
 import type { Batch } from '@/types/batch'
 import type { Formula } from '@/types/formula'
+import type { LocalEditInput } from '@/types/sync'
 import { round } from '@/utils/ratio'
 
 /** 一天的毫秒数 */
@@ -52,6 +54,7 @@ export const useCellarStore = defineStore('cellar', () => {
   const cellarTable = useIdbTable<Cellar>((database) => database.cellars)
   const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
   const formulaTable = useIdbTable<Formula>((database) => database.formulas, { sortByUpdatedAt: false })
+  const guard = useSyncGuard()
 
   const prefs = readUiPrefs()
   const sortMode = ref<'remain' | 'start'>(prefs.cellarSort)
@@ -92,6 +95,18 @@ export const useCellarStore = defineStore('cellar', () => {
     const name = formulaNameMap.value[batch.formulaId] ?? '香方已删除'
     return `${name} · ${batch.mixedAt} · ${batch.formingMethod}`
   }
+
+  /** 批次旧快照是否待复核（香方改动后未复核，不得按新配比登记出窖 / 品香） */
+  function isBatchPendingReview(batchId: string): boolean {
+    return pendingReviewBatchIds.value.has(batchId)
+  }
+
+  /** 待复核批次数量（窖藏页 / 批次页 / 品香页统一口径） */
+  const pendingReviewBatchIds = computed<Set<string>>(
+    () => new Set(batches.value.filter((batch) => batch.reviewState === '待复核').map((batch) => batch.id))
+  )
+
+  const pendingReviewCount = computed(() => pendingReviewBatchIds.value.size)
 
   function urgencyOf(cellar: Cellar): CellarUrgency {
     if (cellar.state === '已出窖') return 'done'
@@ -217,61 +232,108 @@ export const useCellarStore = defineStore('cellar', () => {
     humidityPct: number
     container: CellarContainer
     state?: CellarState
-  }): Promise<Cellar> {
-    return cellarTable.create(
-      {
-        batchId: payload.batchId,
-        startDate: payload.startDate,
-        endDate: payload.endDate,
-        temperatureC: round(payload.temperatureC, 1),
-        humidityPct: round(payload.humidityPct, 1),
-        container: payload.container,
-        state: payload.state ?? '窖藏中'
-      },
-      'cellar'
-    )
+  }): Promise<{ cellarId: string; blocked: boolean; queued: boolean }> {
+    const id = createId('cellar')
+    const nextFields = {
+      batchId: payload.batchId,
+      startDate: payload.startDate,
+      endDate: payload.endDate,
+      temperatureC: round(payload.temperatureC, 1),
+      humidityPct: round(payload.humidityPct, 1),
+      container: payload.container,
+      state: payload.state ?? '窖藏中'
+    }
+    const result = await guard.save({
+      table: 'cellars',
+      recordId: id,
+      kind: 'create',
+      nextFields,
+      recordLabel: batchLabel(payload.batchId),
+      formulaId: batchMap.value[payload.batchId]?.formulaId ?? null
+    })
+    return { cellarId: id, blocked: result.conflicts.length > 0, queued: result.queued }
   }
 
-  async function updateCellar(id: string, patch: Partial<Cellar>): Promise<void> {
+  async function updateCellar(id: string, patch: Partial<Cellar>): Promise<{ blocked: boolean; queued: boolean }> {
+    const cellar = cellarById(id)
+    if (!cellar) return { blocked: false, queued: false }
     const next: Partial<Cellar> = { ...patch }
     if (patch.temperatureC !== undefined) next.temperatureC = round(patch.temperatureC, 1)
     if (patch.humidityPct !== undefined) next.humidityPct = round(patch.humidityPct, 1)
-    await cellarTable.update(id, next)
+    const baseFields: Record<string, unknown> = {}
+    Object.keys(next).forEach((field) => {
+      baseFields[field] = (cellar as unknown as Record<string, unknown>)[field]
+    })
+    const result = await guard.save({
+      table: 'cellars',
+      recordId: id,
+      kind: 'update',
+      baseFields,
+      nextFields: next as Record<string, unknown>,
+      recordLabel: batchLabel(cellar.batchId),
+      formulaId: batchMap.value[cellar.batchId]?.formulaId ?? null
+    })
+    return { blocked: result.conflicts.length > 0, queued: result.queued }
   }
 
-  /** 状态流转：窖藏中 → 已出窖（可回退） */
-  async function advanceState(id: string): Promise<CellarState | null> {
+  /** 状态流转：窖藏中 → 已出窖（可回退）；旧快照待复核时禁止出窖 */
+  async function advanceState(id: string): Promise<{ next: CellarState | null; blocked: boolean; queued: boolean }> {
     const cellar = cellarById(id)
-    if (!cellar) return null
+    if (!cellar) return { next: null, blocked: false, queued: false }
     const next = CELLAR_STATE_FLOW[cellar.state]
     const patch: Partial<Cellar> = { state: next }
     if (next === '已出窖' && cellar.endDate > todayIso()) {
       patch.endDate = todayIso()
     }
-    await cellarTable.update(id, patch)
-    return next
+    if (next === '已出窖' && isBatchPendingReview(cellar.batchId)) {
+      return { next: null, blocked: true, queued: false }
+    }
+    const result = await updateCellar(id, patch)
+    return { next, blocked: result.blocked, queued: result.queued }
   }
 
-  async function setState(id: string, state: CellarState): Promise<void> {
-    await cellarTable.update(id, { state })
+  async function setState(id: string, state: CellarState): Promise<{ blocked: boolean; queued: boolean }> {
+    const cellar = cellarById(id)
+    if (!cellar || cellar.state === state) return { blocked: false, queued: false }
+    if (state === '已出窖' && isBatchPendingReview(cellar.batchId)) {
+      return { blocked: true, queued: false }
+    }
+    return updateCellar(id, { state })
   }
 
-  /** 一键出窖：把全部逾期的在窖批次置为已出窖 */
-  async function releaseOverdue(): Promise<number> {
+  /** 一键出窖：跳过旧快照待复核的批次（未复核不许按新配比登记出窖） */
+  async function releaseOverdue(): Promise<{ released: number; skippedPending: number }> {
     const targets = rows.value.filter((row) => row.cellar.state === '窖藏中' && row.remainDays < 0)
-    if (targets.length === 0) return 0
-    const now = Date.now()
-    await db.transaction('rw', db.cellars, async () => {
-      for (const row of targets) {
-        await db.cellars.update(row.cellar.id, { state: '已出窖', updatedAt: now })
-      }
-    })
-    return targets.length
+    const allowed = targets.filter((row) => !isBatchPendingReview(row.cellar.batchId))
+    const skipped = targets.length - allowed.length
+    if (allowed.length === 0) return { released: 0, skippedPending: skipped }
+    const inputs: LocalEditInput[] = allowed.map((row) => ({
+      table: 'cellars',
+      recordId: row.cellar.id,
+      kind: 'update',
+      baseFields: { state: row.cellar.state, endDate: row.cellar.endDate },
+      nextFields: { state: '已出窖', endDate: todayIso() },
+      recordLabel: row.batchLabel,
+      formulaId: batchMap.value[row.cellar.batchId]?.formulaId ?? null
+    }))
+    await guard.run(inputs)
+    return { released: allowed.length, skippedPending: skipped }
   }
 
-  async function removeCellar(id: string): Promise<void> {
-    await cellarTable.remove(id)
+  async function removeCellar(id: string): Promise<{ blocked: boolean; queued: boolean }> {
+    const cellar = cellarById(id)
+    if (!cellar) return { blocked: false, queued: false }
+    const result = await guard.save({
+      table: 'cellars',
+      recordId: id,
+      kind: 'delete',
+      baseFields: { batchId: cellar.batchId, state: cellar.state, endDate: cellar.endDate },
+      nextFields: {},
+      recordLabel: batchLabel(cellar.batchId),
+      formulaId: batchMap.value[cellar.batchId]?.formulaId ?? null
+    })
     if (currentCellarId.value === id) currentCellarId.value = null
+    return { blocked: result.conflicts.length > 0, queued: result.queued }
   }
 
   async function removeCellarsOfBatch(batchId: string): Promise<number> {
@@ -279,6 +341,113 @@ export const useCellarStore = defineStore('cellar', () => {
     if (ids.length === 0) return 0
     await cellarTable.bulkRemove(ids)
     return ids.length
+  }
+
+  /** 当前香方是否有待复核批次：配比页登记新批次前读取 */
+  function formulaHasPendingReview(formulaId: string): boolean {
+    return batches.value.some((batch) => batch.formulaId === formulaId && batch.reviewState === '待复核')
+  }
+
+  /**
+   * 登记和香批次（自动固化当前配比快照）。
+   * 所属香方存在待复核旧批次时拒绝登记：未复核前不许按新配比出窖 / 开新批。
+   */
+  async function registerBatch(payload: {
+    formulaId: string
+    mixedAt: string
+    formingMethod: Batch['formingMethod']
+    quantity: number
+    operator: string
+    snapshot: Batch['snapshot']
+  }): Promise<{ batchId: string | null; blockedByReview: boolean; conflict: boolean; queued: boolean }> {
+    if (formulaHasPendingReview(payload.formulaId)) {
+      return { batchId: null, blockedByReview: true, conflict: false, queued: false }
+    }
+    const id = createId('batch')
+    const formulaName = formulaNameMap.value[payload.formulaId] ?? '香方'
+    const now = Date.now()
+    const result = await guard.save({
+      table: 'batches',
+      recordId: id,
+      kind: 'create',
+      nextFields: {
+        formulaId: payload.formulaId,
+        mixedAt: payload.mixedAt,
+        formingMethod: payload.formingMethod,
+        quantity: payload.quantity,
+        operator: payload.operator,
+        snapshot: payload.snapshot,
+        snapshotAt: now,
+        reviewState: '正常',
+        staleAt: 0,
+        reviewedAt: 0
+      },
+      recordLabel: `${formulaName} · ${payload.mixedAt} · ${payload.formingMethod}`,
+      formulaId: payload.formulaId
+    })
+    return {
+      batchId: id,
+      blockedByReview: false,
+      conflict: result.conflicts.length > 0,
+      queued: result.queued
+    }
+  }
+
+  /** 编辑批次元信息（不动快照，不改变复核状态） */
+  async function updateBatchMeta(
+    id: string,
+    patch: Partial<Pick<Batch, 'formulaId' | 'mixedAt' | 'formingMethod' | 'quantity' | 'operator'>>
+  ): Promise<{ blocked: boolean; queued: boolean }> {
+    const batch = batches.value.find((item) => item.id === id)
+    if (!batch) return { blocked: false, queued: false }
+    const baseFields: Record<string, unknown> = {}
+    Object.keys(patch).forEach((field) => {
+      baseFields[field] = (batch as unknown as Record<string, unknown>)[field]
+    })
+    const result = await guard.save({
+      table: 'batches',
+      recordId: id,
+      kind: 'update',
+      baseFields,
+      nextFields: patch as Record<string, unknown>,
+      recordLabel: `${formulaNameMap.value[batch.formulaId] ?? '香方'} · ${batch.mixedAt}`,
+      formulaId: batch.formulaId
+    })
+    return { blocked: result.conflicts.length > 0, queued: result.queued }
+  }
+
+  /**
+   * 复核通过：按当前配比重新固化快照、清除待复核标记。
+   * 这是唯一允许「按新配比」覆盖旧快照的入口。
+   */
+  async function reviewBatchSnapshot(
+    id: string,
+    snapshot: Batch['snapshot']
+  ): Promise<{ blocked: boolean; queued: boolean }> {
+    const batch = batches.value.find((item) => item.id === id)
+    if (!batch) return { blocked: false, queued: false }
+    const now = Date.now()
+    const result = await guard.save({
+      table: 'batches',
+      recordId: id,
+      kind: 'review',
+      baseFields: {
+        snapshot: batch.snapshot,
+        reviewState: batch.reviewState,
+        staleAt: batch.staleAt,
+        reviewedAt: batch.reviewedAt
+      },
+      nextFields: {
+        snapshot,
+        snapshotAt: now,
+        reviewState: '正常',
+        staleAt: 0,
+        reviewedAt: now
+      },
+      recordLabel: `${formulaNameMap.value[batch.formulaId] ?? '香方'} · ${batch.mixedAt}`,
+      formulaId: batch.formulaId
+    })
+    return { blocked: result.conflicts.length > 0, queued: result.queued }
   }
 
   return {
@@ -304,6 +473,13 @@ export const useCellarStore = defineStore('cellar', () => {
     hasFilter,
     batchMap,
     batchLabel,
+    pendingReviewBatchIds,
+    pendingReviewCount,
+    isBatchPendingReview,
+    formulaHasPendingReview,
+    registerBatch,
+    updateBatchMeta,
+    reviewBatchSnapshot,
     setSortMode,
     setCurrentCellar,
     patchFilter,

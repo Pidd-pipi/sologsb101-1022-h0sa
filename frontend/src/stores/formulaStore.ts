@@ -2,8 +2,10 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { db, createId, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { useSyncGuard } from '@/hooks/useSyncGuard'
 import type { Batch } from '@/types/batch'
 import type { Tasting } from '@/types/tasting'
+import type { LocalEditInput } from '@/types/sync'
 import {
   createEmptyFormulaFilter,
   FORMULA_STATE_FLOW,
@@ -24,6 +26,7 @@ export const useFormulaStore = defineStore('formula', () => {
   const formulaTable = useIdbTable<Formula>((database) => database.formulas)
   const batchTable = useIdbTable<Batch>((database) => database.batches)
   const tastingTable = useIdbTable<Tasting>((database) => database.tastings)
+  const guard = useSyncGuard()
 
   const prefs = readUiPrefs()
   const currentFormulaId = ref<string | null>(prefs.lastFormulaId)
@@ -75,27 +78,39 @@ export const useFormulaStore = defineStore('formula', () => {
     return grouped
   })
 
-  /** 同香方全部品香的评分均分 */
+  /**
+   * 同香方全部品香的评分均分。
+   * 旧快照待复核批次上的品香暂不计入：香方改动后未复核前，不让品香均分归到新配比上。
+   */
   const scoreAggregates = computed<Record<string, { count: number; average: number; latestAt: string }>>(() => {
+    const pendingBatchIds = new Set(
+      batches.value.filter((batch) => batch.reviewState === '待复核').map((batch) => batch.id)
+    )
     const aggregate: Record<string, { count: number; average: number; latestAt: string }> = {}
     Object.entries(tastingsByFormula.value).forEach(([formulaId, list]) => {
-      if (list.length === 0) return
-      const sum = list.reduce((acc, item) => acc + item.smokeScore, 0)
-      const latest = [...list].sort((a, b) => b.tastedAt.localeCompare(a.tastedAt))[0]
+      const effective = list.filter((tasting) => !pendingBatchIds.has(tasting.batchId))
+      if (effective.length === 0) return
+      const sum = effective.reduce((acc, item) => acc + item.smokeScore, 0)
+      const latest = [...effective].sort((a, b) => b.tastedAt.localeCompare(a.tastedAt))[0]
       aggregate[formulaId] = {
-        count: list.length,
-        average: round(sum / list.length, 1),
+        count: effective.length,
+        average: round(sum / effective.length, 1),
         latestAt: latest?.tastedAt ?? ''
       }
     })
     return aggregate
   })
 
-  /** 香方台账卡片：配比合计、香料数、品香均分、批次数量 */
-  const cards = computed<FormulaCard[]>(() =>
-    formulas.value.map((formula) => {
+  /** 香方台账卡片：配比合计、香料数、品香均分（待复核批次品香不计入）、批次数量 */
+  const cards = computed<FormulaCard[]>(() => {
+    const pendingBatchIds = new Set(
+      batches.value.filter((batch) => batch.reviewState === '待复核').map((batch) => batch.id)
+    )
+    return formulas.value.map((formula) => {
       const aggregate = scoreAggregates.value[formula.id]
-      const formulaTastings = tastingsByFormula.value[formula.id] ?? []
+      const formulaTastings = (tastingsByFormula.value[formula.id] ?? []).filter(
+        (tasting) => !pendingBatchIds.has(tasting.batchId)
+      )
       const latest = [...formulaTastings].sort((a, b) => b.tastedAt.localeCompare(a.tastedAt))[0]
       return {
         formula,
@@ -106,7 +121,7 @@ export const useFormulaStore = defineStore('formula', () => {
         ratioGap: round(formula.totalRatio - 100, 2)
       }
     })
-  )
+  })
 
   const cardMap = computed<Record<string, FormulaCard>>(() => {
     const map: Record<string, FormulaCard> = {}
@@ -188,23 +203,52 @@ export const useFormulaStore = defineStore('formula', () => {
     createdAt: string
     state?: FormulaState
   }): Promise<Formula> {
-    const formula = await formulaTable.create(
-      {
-        name: payload.name.trim(),
-        scentType: payload.scentType,
-        usage: payload.usage,
-        createdAt: payload.createdAt,
+    const formula: Formula = {
+      id: createId('formula'),
+      name: payload.name.trim(),
+      scentType: payload.scentType,
+      usage: payload.usage,
+      createdAt: payload.createdAt,
+      totalRatio: 0,
+      state: payload.state ?? '草稿',
+      updatedAt: Date.now()
+    }
+    await guard.save({
+      table: 'formulas',
+      recordId: formula.id,
+      kind: 'create',
+      nextFields: {
+        name: formula.name,
+        scentType: formula.scentType,
+        usage: formula.usage,
+        createdAt: formula.createdAt,
         totalRatio: 0,
-        state: payload.state ?? '草稿'
+        state: formula.state
       },
-      'formula'
-    )
+      recordLabel: formula.name,
+      formulaId: formula.id
+    })
     currentFormulaId.value = formula.id
     return formula
   }
 
+  /** 香方主档字段（不含合计，合计由配比页单独走守卫回写） */
   async function updateFormula(id: string, patch: Partial<Formula>): Promise<void> {
-    await formulaTable.update(id, patch)
+    const current = formulaById(id)
+    const baseFields: Record<string, unknown> = {}
+    Object.keys(patch).forEach((field) => {
+      if (field === 'updatedAt') return
+      baseFields[field] = (current as unknown as Record<string, unknown> | undefined)?.[field]
+    })
+    await guard.save({
+      table: 'formulas',
+      recordId: id,
+      kind: 'update',
+      baseFields,
+      nextFields: patch as Record<string, unknown>,
+      recordLabel: current?.name ?? '香方',
+      formulaId: id
+    })
   }
 
   /** 状态流转：草稿 → 在用 → 停用 → 在用 */
@@ -212,31 +256,49 @@ export const useFormulaStore = defineStore('formula', () => {
     const formula = formulaById(id)
     if (!formula) return null
     const next = FORMULA_STATE_FLOW[formula.state]
-    await formulaTable.update(id, { state: next })
+    const result = await guard.save({
+      table: 'formulas',
+      recordId: id,
+      kind: 'update',
+      baseFields: { state: formula.state },
+      nextFields: { state: next },
+      recordLabel: formula.name,
+      formulaId: id
+    })
+    if (result.conflicts.length > 0 || result.queued) return null
     return next
   }
 
   async function setState(id: string, state: FormulaState): Promise<void> {
-    await formulaTable.update(id, { state })
+    const formula = formulaById(id)
+    if (!formula) return
+    await guard.save({
+      table: 'formulas',
+      recordId: id,
+      kind: 'update',
+      baseFields: { state: formula.state },
+      nextFields: { state },
+      recordLabel: formula.name,
+      formulaId: id
+    })
   }
 
-  /** 级联删除：香方 → 配比 → 批次 → 窖藏 → 品香 */
+  /** 级联删除：香方 → 配比 → 批次 → 窖藏 → 品香（统一走协同守卫，级联由引擎完成） */
   async function removeFormula(id: string): Promise<{ proportions: number; batches: number; cellars: number; tastings: number }> {
     const batchIds = batches.value.filter((batch) => batch.formulaId === id).map((batch) => batch.id)
     const proportionIds = await db.proportions.where('formulaId').equals(id).primaryKeys()
     const cellarIds = batchIds.length > 0 ? await db.cellars.where('batchId').anyOf(batchIds).primaryKeys() : []
     const tastingIds = batchIds.length > 0 ? await db.tastings.where('batchId').anyOf(batchIds).primaryKeys() : []
-    await db.transaction(
-      'rw',
-      [db.formulas, db.proportions, db.batches, db.cellars, db.tastings],
-      async () => {
-        await db.tastings.bulkDelete(tastingIds)
-        await db.cellars.bulkDelete(cellarIds)
-        await db.batches.bulkDelete(batchIds)
-        await db.proportions.bulkDelete(proportionIds)
-        await db.formulas.delete(id)
-      }
-    )
+    const formula = formulaById(id)
+    await guard.save({
+      table: 'formulas',
+      recordId: id,
+      kind: 'delete',
+      baseFields: formula ? { name: formula.name, state: formula.state } : {},
+      nextFields: {},
+      recordLabel: formula?.name ?? '香方',
+      formulaId: id
+    })
     if (currentFormulaId.value === id) currentFormulaId.value = null
     return {
       proportions: proportionIds.length,
@@ -246,34 +308,61 @@ export const useFormulaStore = defineStore('formula', () => {
     }
   }
 
-  /** 复制香方：连同配比一起复制为新草稿，便于派生新方 */
+  /** 复制香方：连同配比一起复制为新草稿（全部为新建，走守卫以便离线下暂存） */
   async function duplicateFormula(id: string): Promise<Formula | null> {
     const source = formulaById(id)
     if (!source) return null
     const proportions = await db.proportions.where('formulaId').equals(id).toArray()
-    const now = Date.now()
-    const copy = await formulaTable.create(
-      {
-        name: `${source.name}（副本）`,
-        scentType: source.scentType,
-        usage: source.usage,
-        createdAt: new Date().toISOString().slice(0, 10),
-        totalRatio: source.totalRatio,
-        state: '草稿'
-      },
-      'formula'
-    )
-    if (proportions.length > 0) {
-      await db.proportions.bulkPut(
-        proportions.map((proportion, index) => ({
-          ...proportion,
-          id: createId('prop'),
-          formulaId: copy.id,
-          seq: proportion.seq > 0 ? proportion.seq : index + 1,
-          updatedAt: now
-        }))
-      )
+    const copy: Formula = {
+      id: createId('formula'),
+      name: `${source.name}（副本）`,
+      scentType: source.scentType,
+      usage: source.usage,
+      createdAt: new Date().toISOString().slice(0, 10),
+      totalRatio: source.totalRatio,
+      state: '草稿',
+      updatedAt: Date.now()
     }
+    const newProportions = proportions.map((proportion, index) => ({
+      ...proportion,
+      id: createId('prop'),
+      formulaId: copy.id,
+      seq: proportion.seq > 0 ? proportion.seq : index + 1
+    }))
+    const inputs: LocalEditInput[] = [
+      {
+        table: 'formulas',
+        recordId: copy.id,
+        kind: 'create',
+        nextFields: {
+          name: copy.name,
+          scentType: copy.scentType,
+          usage: copy.usage,
+          createdAt: copy.createdAt,
+          totalRatio: copy.totalRatio,
+          state: copy.state
+        },
+        recordLabel: copy.name,
+        formulaId: copy.id
+      },
+      ...newProportions.map((proportion) => ({
+        table: 'proportions' as const,
+        recordId: proportion.id,
+        kind: 'create' as const,
+        nextFields: {
+          formulaId: copy.id,
+          materialId: proportion.materialId,
+          ratio: proportion.ratio,
+          role: proportion.role,
+          note: proportion.note,
+          seq: proportion.seq
+        },
+        recordLabel: `${copy.name} 配比`,
+        formulaId: copy.id
+      }))
+    ]
+    await guard.run(inputs)
+    currentFormulaId.value = copy.id
     return copy
   }
 

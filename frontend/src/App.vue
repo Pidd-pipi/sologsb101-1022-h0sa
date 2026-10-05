@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Component } from 'vue'
 import { Box, Coin, Files, Histogram, Notebook, Sugar } from '@element-plus/icons-vue'
@@ -7,7 +7,11 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
+import { useSyncStore } from '@/stores/syncStore'
 import { DB_VERSION } from '@/utils/db'
+import { pruneExtraMergedChanges, pruneMergedChanges } from '@/utils/sync'
+import SyncStatusBar from '@/components/common/SyncStatusBar.vue'
+import ConflictCenter from '@/components/common/ConflictCenter.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -15,6 +19,14 @@ const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
+const syncStore = useSyncStore()
+
+onMounted(() => {
+  // 绑定在线 / 离线 / 标签页重新可见事件：重连后自动合并不重叠改动，重叠项挂冲突
+  syncStore.bindConnectivity()
+  void syncStore.reconcile()
+  void pruneMergedChanges().then(() => pruneExtraMergedChanges())
+})
 
 interface NavItem {
   path: string
@@ -113,10 +125,13 @@ function go(path: string): void {
       <p class="app-crumb muted">
         当前位置：{{ currentTitle }} · 本地结构版本 v{{ DB_VERSION }}
       </p>
+      <SyncStatusBar />
       <router-view v-slot="{ Component: PageComponent }">
         <component :is="PageComponent" />
       </router-view>
     </main>
+
+    <ConflictCenter />
 
     <footer class="app-footer">
       <span>数据仅存于本浏览器（IndexedDB / Dexie + localStorage），不上传任何服务器。</span>

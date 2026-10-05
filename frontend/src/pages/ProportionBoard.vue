@@ -10,6 +10,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
+import { useCellarStore } from '@/stores/cellarStore'
 import { useProportion, type ProportionRow } from '@/hooks/useProportion'
 import { PROPORTION_ROLES, ROLE_COLOR, ROLE_HINT, type ProportionRole } from '@/types/proportion'
 import { MATERIAL_GRADES } from '@/types/material'
@@ -20,7 +21,8 @@ const router = useRouter()
 const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
-const { rows, rolePreview, total, gap, checkLevel, checkMessage, add, update, remove, rescale, sortByRole, reorder, clearFormula } =
+const cellarStore = useCellarStore()
+const { rows, rolePreview, total, gap, checkLevel, checkMessage, add, update, remove, rescale, sortByRole, reorder, clearFormula, blockedByConflict, queuedOffline } =
   useProportion()
 
 const dialogVisible = ref(false)
@@ -221,15 +223,25 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await update(editingId.value, {
+      const ok = await update(editingId.value, {
         materialId: form.materialId,
         ratio: form.ratio,
         role: form.role,
         note: form.note
       })
+      if (!ok) {
+        ElMessage.warning(queuedOffline.value ? '浏览器离线，配比改动已暂存，重连后自动合并' : '另一标签页也改了这项，请到冲突中心逐项确认')
+        if (blockedByConflict.value) dialogVisible.value = false
+        return
+      }
       ElMessage.success('配比已更新')
     } else {
-      await add({ materialId: form.materialId, ratio: form.ratio, role: form.role, note: form.note })
+      const record = await add({ materialId: form.materialId, ratio: form.ratio, role: form.role, note: form.note })
+      if (!record) {
+        ElMessage.warning(queuedOffline.value ? '浏览器离线，新增配比已暂存，重连后自动合并' : '另一标签页同时保存了改动，请到冲突中心逐项确认')
+        if (blockedByConflict.value) dialogVisible.value = false
+        return
+      }
       ElMessage.success('已加入配比，可继续调整占比')
     }
     dialogVisible.value = false
@@ -240,10 +252,14 @@ async function submitForm(): Promise<void> {
 
 async function quickRatio(row: ProportionRow, value: number): Promise<void> {
   const next = round(value, 2)
-  if (next === row.ratio) return
-  await update(row.proportion.id, { ratio: next })
   if (next < 0 || next > 100) {
     ElMessage.warning('占比应在 0 ~ 100 之间')
+    return
+  }
+  if (next === row.ratio) return
+  const ok = await update(row.proportion.id, { ratio: next })
+  if (!ok) {
+    ElMessage.warning(queuedOffline.value ? `「${row.materialName}」改动已离线暂存，重连后合并` : `「${row.materialName}」与另一标签页改动冲突，待逐项确认`)
     return
   }
   ElMessage.success(`「${row.materialName}」占比改为 ${next}%`)
@@ -257,7 +273,11 @@ async function removeRow(row: ProportionRow): Promise<void> {
   ).catch(() => false)
   if (!confirmed) return
   await remove(row.proportion.id)
-  ElMessage.success('配比已移除')
+  if (blockedByConflict.value) {
+    ElMessage.warning('另一标签页同时改动了该配比，请到冲突中心逐项确认')
+    return
+  }
+  ElMessage.success(queuedOffline.value ? '移除操作已离线暂存，重连后合并' : '配比已移除')
 }
 
 async function doRescale(factor: number): Promise<void> {
@@ -266,8 +286,16 @@ async function doRescale(factor: number): Promise<void> {
     return
   }
   const count = await rescale(factor)
+  if (blockedByConflict.value) {
+    ElMessage.warning('另一标签页正在调整同一批占比，请到冲突中心逐项确认；本次缩放未入库')
+    return
+  }
   ElMessage.success(
-    factor === 1 ? `已按等比归一化 ${count} 条配比，合计校准为 100%` : `已按 ×${factor} 等比缩放 ${count} 条配比`
+    queuedOffline.value
+      ? '浏览器离线，缩放已暂存，重连后自动合并'
+      : factor === 1
+        ? `已按等比归一化 ${count} 条配比，合计校准为 100%`
+        : `已按 ×${factor} 等比缩放 ${count} 条配比`
   )
 }
 
@@ -277,18 +305,26 @@ async function doSortByRole(): Promise<void> {
     return
   }
   await sortByRole()
-  ElMessage.success('已按君臣佐使权重（君 > 臣 > 佐 > 使）重排并写回编排顺序')
+  if (blockedByConflict.value) {
+    ElMessage.warning('另一标签页也在编排同一香方，请到冲突中心逐项确认')
+    return
+  }
+  ElMessage.success(queuedOffline.value ? '排序已离线暂存，重连后合并' : '已按君臣佐使权重（君 > 臣 > 佐 > 使）重排并写回编排顺序')
 }
 
 async function clearAll(): Promise<void> {
   const confirmed = await ElMessageBox.confirm(
-    `清空「${formulaStore.currentFormula?.name ?? '当前香方'}」的全部配比？合计将归零。`,
+    `清空「${formulaStore.currentFormula?.name ?? '当前香方'}」的全部配比？合计将归零，相关在用批次旧快照会立即标成待复核。`,
     '清空确认',
     { type: 'warning', confirmButtonText: '清空', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
   const count = await clearFormula()
-  ElMessage.success(`已清空 ${count} 条配比`)
+  if (blockedByConflict.value) {
+    ElMessage.warning('另一标签页同时改动了该香方配比，请到冲突中心逐项确认；本次清空未入库')
+    return
+  }
+  ElMessage.success(queuedOffline.value ? '清空操作已离线暂存，重连后合并' : `已清空 ${count} 条配比`)
 }
 
 function onDragStart(row: ProportionRow): void {
@@ -309,7 +345,11 @@ async function onDrop(target: ProportionRow): Promise<void> {
   const targetIndex = ordered.indexOf(target.proportion.id)
   ordered.splice(targetIndex, 0, sourceId)
   await reorder(ordered)
-  ElMessage.success('君臣佐使编排顺序已按拖拽结果写回')
+  if (blockedByConflict.value) {
+    ElMessage.warning('另一标签页也在编排该香方，请到冲突中心逐项确认；本次排序未入库')
+    return
+  }
+  ElMessage.success(queuedOffline.value ? '编排已离线暂存，重连后合并' : '君臣佐使编排顺序已按拖拽结果写回')
 }
 
 function onDragEnd(): void {
@@ -368,6 +408,20 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
         拖动手柄可调整君臣佐使编排顺序，排序结果会写回本地数据库；等比缩放会按比例重新分配全部占比。
       </span>
     </div>
+
+    <el-alert
+      v-if="formulaStore.currentFormulaId && cellarStore.formulaHasPendingReview(formulaStore.currentFormulaId)"
+      class="review-strip"
+      type="warning"
+      show-icon
+      :closable="false"
+      title="该香方有用中批次的旧快照待复核"
+      description="本次改方后，旧批次快照已立即失效并标成待复核；未复核通过前不能按新配比登记出窖 / 新品香均分，也不能开新批次。"
+    >
+      <template #default>
+        <el-button size="small" type="warning" plain @click="router.push('/batches')">前往批次页复核</el-button>
+      </template>
+    </el-alert>
 
     <div class="section-card">
       <div class="section-card__head">
@@ -626,5 +680,9 @@ const roleColor = (role: ProportionRole): string => ROLE_COLOR[role]
 .form-hint {
   margin-left: 10px;
   font-size: 12px;
+}
+
+.review-strip {
+  margin-bottom: 16px;
 }
 </style>

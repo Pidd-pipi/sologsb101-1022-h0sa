@@ -5,9 +5,11 @@ import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { SyncChange } from '@/types/sync'
+import { isSnapshotStale } from '@/utils/snapshot'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -51,6 +53,8 @@ export class IncenseDatabase extends Dexie {
   batches!: Table<Batch, string>
   cellars!: Table<Cellar, string>
   tastings!: Table<Tasting, string>
+  /** 多标签页改动流水：冲突检测与重连合并的依据 */
+  changes!: Table<SyncChange, string>
 
   constructor() {
     super('gbincense')
@@ -64,7 +68,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -108,6 +112,50 @@ export class IncenseDatabase extends Dexie {
             }
           })
       })
+    // v3：多标签页协同改动流水表；旧批次补复核字段，旧快照与当前配比不一致的标成待复核
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, reviewState, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt',
+        changes: 'id, clientId, table, recordId, status, kind, [table+recordId], createdAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        // 迁移 1：旧档案的批次补复核字段；旧快照与当前香方配比不一致的立即标为待复核
+        const currentByFormula = new Map<string, Proportion[]>()
+        const proportions = await tx.table<Proportion>('proportions').toArray()
+        proportions.forEach((proportion) => {
+          const list = currentByFormula.get(proportion.formulaId) ?? []
+          list.push(proportion)
+          currentByFormula.set(proportion.formulaId, list)
+        })
+        await tx
+          .table<Batch>('batches')
+          .toCollection()
+          .modify((batch) => {
+            if (typeof batch.reviewState !== 'string') batch.reviewState = '正常'
+            if (typeof batch.staleAt !== 'number') batch.staleAt = 0
+            if (typeof batch.reviewedAt !== 'number') batch.reviewedAt = 0
+            const current = currentByFormula.get(batch.formulaId) ?? []
+            if (batch.reviewState === '正常' && Array.isArray(batch.snapshot) && batch.snapshot.length > 0 && isSnapshotStale(batch.snapshot, current)) {
+              batch.reviewState = '待复核'
+              batch.staleAt = now
+            }
+            if (!Number.isFinite(batch.updatedAt)) batch.updatedAt = now
+          })
+        // 迁移 2：极旧档案的快照字段兜底（v1 直跳 v3 时也不能留 undefined）
+        await tx
+          .table<Batch>('batches')
+          .toCollection()
+          .modify((batch) => {
+            if (!Array.isArray(batch.snapshot)) batch.snapshot = []
+            if (typeof batch.snapshotAt !== 'number') batch.snapshotAt = 0
+          })
+      })
   }
 }
 
@@ -123,7 +171,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.changes],
     async () => {
       await Promise.all([
         db.formulas.clear(),
@@ -131,7 +179,8 @@ export async function clearAllTables(): Promise<void> {
         db.proportions.clear(),
         db.batches.clear(),
         db.cellars.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.changes.clear()
       ])
     }
   )
@@ -389,6 +438,9 @@ export async function seedDatabase(): Promise<void> {
       operator: '林砚舟',
       snapshot: toSnapshot(lineRatio),
       snapshotAt: new Date('2024-04-01T09:00:00').getTime(),
+      reviewState: '正常',
+      staleAt: 0,
+      reviewedAt: 0,
       updatedAt: now
     },
     {
@@ -400,6 +452,9 @@ export async function seedDatabase(): Promise<void> {
       operator: '周若谷',
       snapshot: toSnapshot(pillRatio),
       snapshotAt: new Date('2024-06-15T14:30:00').getTime(),
+      reviewState: '正常',
+      staleAt: 0,
+      reviewedAt: 0,
       updatedAt: now
     }
   ]

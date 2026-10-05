@@ -8,8 +8,10 @@ import FilterBar, { type FilterModel } from '@/components/common/FilterBar.vue'
 import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useFormulaStore } from '@/stores/formulaStore'
+import { useCellarStore } from '@/stores/cellarStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { DB_VERSION, readLastBackupAt, resetDatabase } from '@/utils/db'
+import { useSyncGuard } from '@/hooks/useSyncGuard'
+import { createId, DB_VERSION, readLastBackupAt, resetDatabase } from '@/utils/db'
 import {
   exportSnapshotJson,
   importSnapshotPayload,
@@ -32,6 +34,8 @@ import {
 const route = useRoute()
 const router = useRouter()
 const formulaStore = useFormulaStore()
+const cellarStore = useCellarStore()
+const guard = useSyncGuard()
 const tastingTable = useIdbTable<Tasting>((database) => database.tastings)
 const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
 
@@ -93,9 +97,11 @@ const rules: FormRules = {
 const batchOptions = computed(() =>
   batchTable.rows.value.map((batch) => {
     const formula = formulaStore.formulaById(batch.formulaId)
+    const suffix = batch.reviewState === '待复核' ? '（待复核，不可品香）' : ''
     return {
-      label: `${formula?.name ?? '香方已删除'} · ${batch.mixedAt} · ${batch.formingMethod}`,
-      value: batch.id
+      label: `${formula?.name ?? '香方已删除'} · ${batch.mixedAt} · ${batch.formingMethod}${suffix}`,
+      value: batch.id,
+      disabled: batch.reviewState === '待复核'
     }
   })
 )
@@ -186,6 +192,17 @@ const rows = computed<TastingRow[]>(() =>
   })
 )
 
+/** 旧快照待复核批次上的品香：复核通过前不并入香方均分，避免归错香方 */
+function isTastingBlocked(formulaId: string | null, batchId: string): boolean {
+  if (!formulaId) return false
+  return cellarStore.isBatchPendingReview(batchId)
+}
+
+/** 品香均分时只统计旧快照已复核（正常）的批次 */
+const effectiveTastingRows = computed(() =>
+  rows.value.filter((row) => !isTastingBlocked(row.formulaId, row.tasting.batchId))
+)
+
 const filteredRows = computed<TastingRow[]>(() =>
   rows.value.filter((row) => {
     const keyword = filter.value.keyword.trim()
@@ -200,10 +217,10 @@ const filteredRows = computed<TastingRow[]>(() =>
   })
 )
 
-/** 按香方聚合：同批次多次评鉴取均分并回写香方列表 */
+/** 按香方聚合：同批次多次评鉴取均分并回写香方列表（待复核批次的品香不参与） */
 const aggregates = computed<ScoreAggregate[]>(() => {
   const grouped = new Map<string, Tasting[]>()
-  rows.value.forEach((row) => {
+  effectiveTastingRows.value.forEach((row) => {
     if (!row.formulaId) return
     const list = grouped.get(row.formulaId) ?? []
     list.push(row.tasting)
@@ -235,7 +252,7 @@ const lastBackupAt = computed(() => readLastBackupAt())
 
 const countMap = computed<Record<string, number>>(() => {
   const map: Record<string, number> = {}
-  rows.value.forEach((row) => {
+  effectiveTastingRows.value.forEach((row) => {
     if (!row.formulaId) return
     map[row.formulaId] = (map[row.formulaId] ?? 0) + 1
   })
@@ -261,7 +278,7 @@ function openCreate(): void {
   const preferred =
     typeof route.query.batch === 'string' && route.query.batch.length > 0
       ? route.query.batch
-      : batchTable.rows.value[0]?.id ?? ''
+      : batchTable.rows.value.find((batch) => batch.reviewState !== '待复核')?.id ?? ''
   form.batchId = preferred
   form.tastedAt = new Date().toISOString().slice(0, 10)
   form.aroma = ''
@@ -286,21 +303,60 @@ async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  const targetBatch = batchMap.value[form.batchId]
+  // 未复核前不许按新配比登记品香；编辑既有品香时也不允许改挂到待复核批次
+  if (targetBatch?.reviewState === '待复核' && editingId.value) {
+    const original = tastingTable.rows.value.find((item) => item.id === editingId.value)
+    if (original && original.batchId !== form.batchId) {
+      ElMessage.error('不能把品香改挂到旧快照待复核的批次，请先到批次页复核')
+      return
+    }
+  }
+  if (targetBatch?.reviewState === '待复核' && !editingId.value) {
+    ElMessage.error('该批次旧快照待复核，复核通过前不能登记品香，均分也暂不计入该香方')
+    return
+  }
   submitting.value = true
   try {
     if (editingId.value) {
-      await tastingTable.update(editingId.value, {
+      const current = tastingTable.rows.value.find((item) => item.id === editingId.value)
+      const nextFields: Record<string, unknown> = {
         batchId: form.batchId,
         tastedAt: form.tastedAt,
         aroma: form.aroma.trim(),
         lastingMin: form.lastingMin,
         smokeScore: form.smokeScore,
         comment: form.comment.trim()
+      }
+      const baseFields: Record<string, unknown> = current
+        ? {
+            batchId: current.batchId,
+            tastedAt: current.tastedAt,
+            aroma: current.aroma,
+            lastingMin: current.lastingMin,
+            smokeScore: current.smokeScore,
+            comment: current.comment
+          }
+        : {}
+      const batch = batchMap.value[form.batchId]
+      const result = await guard.save({
+        table: 'tastings',
+        recordId: editingId.value,
+        kind: 'update',
+        baseFields,
+        nextFields,
+        recordLabel: batch ? `${formulaStore.formulaName(batch.formulaId)} · ${batch.mixedAt}` : '品香记录',
+        formulaId: batch?.formulaId ?? null
       })
-      ElMessage.success('品香记录已更新，均分已同步到香方台账')
+      if (result.conflicts.length > 0) return
+      ElMessage.success(result.queued ? '浏览器离线，品香改动已暂存，重连后自动合并' : '品香记录已更新，均分已同步到香方台账')
     } else {
-      await tastingTable.create(
-        {
+      const id = createId('tasting')
+      const result = await guard.save({
+        table: 'tastings',
+        recordId: id,
+        kind: 'create',
+        nextFields: {
           batchId: form.batchId,
           tastedAt: form.tastedAt,
           aroma: form.aroma.trim(),
@@ -308,11 +364,18 @@ async function submitForm(): Promise<void> {
           smokeScore: form.smokeScore,
           comment: form.comment.trim()
         },
-        'tasting'
+        recordLabel: targetBatch
+          ? `${formulaStore.formulaName(targetBatch.formulaId)} · ${targetBatch.mixedAt}`
+          : '品香记录',
+        formulaId: targetBatch?.formulaId ?? null
+      })
+      if (result.conflicts.length > 0) return
+      const name = targetBatch ? formulaStore.formulaName(targetBatch.formulaId) : '该香方'
+      ElMessage.success(
+        result.queued
+          ? '浏览器离线，品香已暂存，重连后自动合并'
+          : `已记录「${name}」的品香评鉴，同批次均分已回写香方列表`
       )
-      const batch = batchMap.value[form.batchId]
-      const name = batch ? formulaStore.formulaName(batch.formulaId) : '该香方'
-      ElMessage.success(`已记录「${name}」的品香评鉴，同批次均分已回写香方列表`)
     }
     dialogVisible.value = false
   } finally {
@@ -327,7 +390,20 @@ async function removeTasting(row: TastingRow): Promise<void> {
     { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await tastingTable.remove(row.tasting.id)
+  const result = await guard.save({
+    table: 'tastings',
+    recordId: row.tasting.id,
+    kind: 'delete',
+    baseFields: {
+      batchId: row.tasting.batchId,
+      tastedAt: row.tasting.tastedAt,
+      smokeScore: row.tasting.smokeScore
+    },
+    nextFields: {},
+    recordLabel: `${row.formulaName} · ${row.tasting.tastedAt}`,
+    formulaId: row.formulaId
+  })
+  if (result.conflicts.length > 0 || result.queued) return
   ElMessage.success('品香记录已删除，香方均分已重新计算')
 }
 
@@ -495,6 +571,14 @@ function onlyFormula(formulaId: string): void {
           <template #default="{ row }: { row: TastingRow }">
             <div class="cell-main">{{ row.formulaName }}</div>
             <div class="cell-sub muted">{{ row.batchLabel }}</div>
+            <el-tag
+              v-if="row.formulaId && cellarStore.isBatchPendingReview(row.tasting.batchId)"
+              type="warning"
+              size="small"
+              effect="plain"
+            >
+              旧方快照待复核，暂不计入均分
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="品鉴日期" prop="tasting.tastedAt" width="120" />
@@ -533,8 +617,23 @@ function onlyFormula(formulaId: string): void {
       <el-form ref="formRef" :model="form" :rules="rules" label-width="104px">
         <el-form-item label="和香批次" prop="batchId">
           <el-select v-model="form.batchId" filterable placeholder="选择批次" style="width: 100%">
-            <el-option v-for="item in batchOptions" :key="item.value" :label="item.label" :value="item.value" />
+            <el-option
+              v-for="item in batchOptions"
+              :key="item.value"
+              :label="item.label"
+              :value="item.value"
+              :disabled="item.disabled"
+            />
           </el-select>
+          <el-alert
+            v-if="form.batchId && cellarStore.isBatchPendingReview(form.batchId)"
+            class="ratio-alert-inline"
+            type="error"
+            :closable="false"
+            show-icon
+            title="该批次旧快照待复核，复核通过前不能登记品香"
+            description="请先到「和香批次」复核；复核前这条品香即使存在，其均分也不会计入香方。"
+          />
         </el-form-item>
         <el-form-item label="品鉴日期" prop="tastedAt">
           <el-date-picker
@@ -615,6 +714,10 @@ function onlyFormula(formulaId: string): void {
 
 .score-preview {
   margin-left: 12px;
+}
+
+.ratio-alert-inline {
+  margin-top: 8px;
 }
 
 .import-file {

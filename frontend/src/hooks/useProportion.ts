@@ -1,10 +1,12 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
-import { db } from '@/utils/db'
+import { createId, db } from '@/utils/db'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
+import { useSyncGuard } from '@/hooks/useSyncGuard'
 import type { Proportion, ProportionRole } from '@/types/proportion'
 import type { Material, MaterialGrade, ProcessMethod } from '@/types/material'
+import type { LocalEditInput } from '@/types/sync'
 import {
   applyManualOrder,
   checkRatioTotal,
@@ -54,8 +56,12 @@ export interface UseProportionResult {
   checkMessage: ComputedRef<string>
   loading: Ref<boolean>
   error: Ref<string | null>
-  add: (payload: ProportionFormPayload) => Promise<Proportion>
-  update: (id: string, patch: Partial<ProportionFormPayload>) => Promise<void>
+  /** 最近一次保存被冲突拦截的条数（>0 时数据未写入，冲突中心等待逐项确认） */
+  blockedByConflict: Ref<boolean>
+  /** 最近一次保存是否因离线进入暂存队列 */
+  queuedOffline: Ref<boolean>
+  add: (payload: ProportionFormPayload) => Promise<Proportion | null>
+  update: (id: string, patch: Partial<ProportionFormPayload>) => Promise<boolean>
   remove: (id: string) => Promise<void>
   /** 一键等比缩放到合计 100（可指定缩放因子） */
   rescale: (factor?: number) => Promise<number>
@@ -78,9 +84,12 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   const proportionStore = useProportionStore()
   const formulaStore = useFormulaStore()
   const materialStore = useMaterialStore()
+  const guard = useSyncGuard()
 
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const blockedByConflict = ref(false)
+  const queuedOffline = ref(false)
 
   const formulaId = computed<string | null>(() =>
     options.formulaId ? options.formulaId.value : formulaStore.currentFormulaId
@@ -120,13 +129,21 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   const checkLevel = computed(() => totals.value.level)
   const checkMessage = computed(() => totals.value.message)
 
-  /** 配比变化后把合计回写到香方，供香方台账与批次页读取 */
+  /** 配比变化后把合计回写到香方，供香方台账与批次页读取（同样走协同守卫） */
   async function syncFormulaTotal(): Promise<void> {
     const id = formulaId.value
     if (!id) return
     const current = await db.formulas.get(id)
     if (!current || current.totalRatio === total.value) return
-    await db.formulas.update(id, { totalRatio: total.value, updatedAt: Date.now() })
+    await guard.save({
+      table: 'formulas',
+      recordId: id,
+      kind: 'update',
+      baseFields: { totalRatio: current.totalRatio },
+      nextFields: { totalRatio: total.value },
+      recordLabel: current.name,
+      formulaId: id
+    })
   }
 
   watch(total, () => {
@@ -138,20 +155,46 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     return list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1
   }
 
-  async function add(payload: ProportionFormPayload): Promise<Proportion> {
+  async function add(payload: ProportionFormPayload): Promise<Proportion | null> {
     const id = formulaId.value
     if (!id) throw new Error('请先选择香方')
     loading.value = true
+    blockedByConflict.value = false
+    queuedOffline.value = false
     try {
-      const record = await proportionStore.createProportion({
+      const seq = nextSeq(id)
+      const newId = createId('prop')
+      const record: Proportion = {
+        id: newId,
         formulaId: id,
         materialId: payload.materialId,
         ratio: round(payload.ratio, 2),
         role: payload.role,
         note: payload.note.trim(),
-        seq: nextSeq(id)
+        seq,
+        updatedAt: Date.now()
+      }
+      const formula = formulaStore.formulaById(id)
+      const materialName = materialStore.materialName(payload.materialId)
+      const result = await guard.save({
+        table: 'proportions',
+        recordId: newId,
+        kind: 'create',
+        nextFields: {
+          formulaId: id,
+          materialId: payload.materialId,
+          ratio: record.ratio,
+          role: payload.role,
+          note: record.note,
+          seq
+        },
+        recordLabel: `${formula?.name ?? '当前香方'} · ${materialName}`,
+        formulaId: id
       })
+      blockedByConflict.value = result.conflicts.length > 0
+      queuedOffline.value = result.queued
       await syncFormulaTotal()
+      if (blockedByConflict.value || result.queued) return null
       return record
     } catch (err) {
       error.value = err instanceof Error ? err.message : '新增配比失败'
@@ -161,16 +204,45 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     }
   }
 
-  async function update(id: string, patch: Partial<ProportionFormPayload>): Promise<void> {
+  async function update(id: string, patch: Partial<ProportionFormPayload>): Promise<boolean> {
     loading.value = true
+    blockedByConflict.value = false
+    queuedOffline.value = false
     try {
-      const next: Partial<Proportion> = {}
-      if (patch.materialId !== undefined) next.materialId = patch.materialId
-      if (patch.ratio !== undefined) next.ratio = round(patch.ratio, 2)
-      if (patch.role !== undefined) next.role = patch.role
-      if (patch.note !== undefined) next.note = patch.note.trim()
-      await proportionStore.updateProportion(id, next)
+      const existing = proportionStore.proportions.find((item) => item.id === id)
+      if (!existing) throw new Error('配比记录不存在或已被另一标签页删除')
+      const nextFields: Record<string, unknown> = {}
+      const baseFields: Record<string, unknown> = {}
+      if (patch.materialId !== undefined) {
+        nextFields.materialId = patch.materialId
+        baseFields.materialId = existing.materialId
+      }
+      if (patch.ratio !== undefined) {
+        nextFields.ratio = round(patch.ratio, 2)
+        baseFields.ratio = existing.ratio
+      }
+      if (patch.role !== undefined) {
+        nextFields.role = patch.role
+        baseFields.role = existing.role
+      }
+      if (patch.note !== undefined) {
+        nextFields.note = patch.note.trim()
+        baseFields.note = existing.note
+      }
+      const formula = formulaStore.formulaById(existing.formulaId)
+      const result = await guard.save({
+        table: 'proportions',
+        recordId: id,
+        kind: 'update',
+        baseFields,
+        nextFields,
+        recordLabel: `${formula?.name ?? '香方'} · ${materialStore.materialName(existing.materialId)}`,
+        formulaId: existing.formulaId
+      })
+      blockedByConflict.value = result.conflicts.length > 0
+      queuedOffline.value = result.queued
       await syncFormulaTotal()
+      return !blockedByConflict.value && !result.queued
     } catch (err) {
       error.value = err instanceof Error ? err.message : '更新配比失败'
       throw err
@@ -180,20 +252,40 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   }
 
   async function remove(id: string): Promise<void> {
-    await proportionStore.removeProportion(id)
+    const existing = proportionStore.proportions.find((item) => item.id === id)
+    if (!existing) return
+    blockedByConflict.value = false
+    queuedOffline.value = false
+    const formula = formulaStore.formulaById(existing.formulaId)
+    const result = await guard.save({
+      table: 'proportions',
+      recordId: id,
+      kind: 'delete',
+      baseFields: {
+        materialId: existing.materialId,
+        ratio: existing.ratio,
+        role: existing.role,
+        note: existing.note
+      },
+      nextFields: {},
+      recordLabel: `${formula?.name ?? '香方'} · ${materialStore.materialName(existing.materialId)}`,
+      formulaId: existing.formulaId
+    })
+    blockedByConflict.value = result.conflicts.length > 0
+    queuedOffline.value = result.queued
     await syncFormulaTotal()
   }
 
-  async function writeRatios(ids: string[], ratios: number[]): Promise<void> {
-    const now = Date.now()
-    await db.transaction('rw', db.proportions, async () => {
-      for (let index = 0; index < ids.length; index += 1) {
-        await db.proportions.update(ids[index], { ratio: round(ratios[index] ?? 0, 2), updatedAt: now })
-      }
+  /** 批量守卫的统一结果处理：任一行冲突则整组未入库 */
+  function applyGuardOutcome(inputs: LocalEditInput[]): Promise<{ ok: boolean; queued: boolean }> {
+    return guard.run(inputs).then((result) => {
+      blockedByConflict.value = result.conflicts.length > 0
+      queuedOffline.value = result.queued
+      return { ok: !blockedByConflict.value && !result.queued, queued: result.queued }
     })
   }
 
-  /** 等比缩放：按 factor 缩放全部占比后归一化到 100 并写回 */
+  /** 等比缩放：按 factor 缩放全部占比后归一化到 100 并写回（整组守卫） */
   async function rescale(factor = 1): Promise<number> {
     const list = rows.value
     if (list.length === 0) return 0
@@ -201,10 +293,18 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
       factor === 1
         ? normalizeRatios(list.map((row) => row.ratio))
         : scaleRatios(list.map((row) => row.ratio), factor)
-    await writeRatios(
-      list.map((row) => row.proportion.id),
-      scaled
-    )
+    const formulaIdValue = formulaId.value ?? ''
+    const formula = formulaStore.formulaById(formulaIdValue)
+    const inputs: LocalEditInput[] = list.map((row, index) => ({
+      table: 'proportions',
+      recordId: row.proportion.id,
+      kind: 'update',
+      baseFields: { ratio: round(row.ratio, 2) },
+      nextFields: { ratio: round(scaled[index] ?? 0, 2) },
+      recordLabel: `${formula?.name ?? '香方'} · ${row.materialName}`,
+      formulaId: formulaIdValue
+    }))
+    await applyGuardOutcome(inputs)
     await syncFormulaTotal()
     return scaled.length
   }
@@ -213,23 +313,32 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     return rescale(factor)
   }
 
-  /** 按君臣佐使权重重排：写回 seq 并切换排序方式 */
+  /** 按君臣佐使权重重排：写回 seq 并切换排序方式（整组守卫） */
   async function sortByRole(): Promise<void> {
     const sorted = sortByRoleWeight(rows.value.map((row) => row.proportion))
     await reorder(sorted.map((item) => item.id))
     proportionStore.setSortMode('role')
   }
 
-  /** 拖拽排序：按传入的 id 顺序回写 seq */
+  /** 拖拽排序：按传入的 id 顺序回写 seq（整组守卫；与另一标签页排序重叠时挂冲突） */
   async function reorder(orderedIds: string[]): Promise<void> {
     if (orderedIds.length === 0) return
     const seqMap = nextSeqMap(orderedIds)
-    const now = Date.now()
-    await db.transaction('rw', db.proportions, async () => {
-      for (const id of orderedIds) {
-        await db.proportions.update(id, { seq: seqMap[id], updatedAt: now })
-      }
-    })
+    const formulaIdValue = formulaId.value ?? ''
+    const formula = formulaStore.formulaById(formulaIdValue)
+    const inputs: LocalEditInput[] = orderedIds
+      .map((id) => proportionStore.proportions.find((item) => item.id === id))
+      .filter((item): item is Proportion => Boolean(item))
+      .map((item) => ({
+        table: 'proportions',
+        recordId: item.id,
+        kind: 'update',
+        baseFields: { seq: item.seq },
+        nextFields: { seq: seqMap[item.id] },
+        recordLabel: `${formula?.name ?? '香方'} · ${materialStore.materialName(item.materialId)} 编排`,
+        formulaId: formulaIdValue
+      }))
+    if (inputs.length > 0) await applyGuardOutcome(inputs)
     proportionStore.setSortMode('manual')
   }
 
@@ -240,9 +349,21 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   async function clearFormula(): Promise<number> {
     const id = formulaId.value
     if (!id) return 0
-    const count = await proportionStore.clearFormulaProportions(id)
+    const list = proportionStore.proportionsByFormula(id)
+    if (list.length === 0) return 0
+    const formula = formulaStore.formulaById(id)
+    const inputs: LocalEditInput[] = list.map((item) => ({
+      table: 'proportions',
+      recordId: item.id,
+      kind: 'delete',
+      baseFields: { ratio: item.ratio, role: item.role, materialId: item.materialId },
+      nextFields: {},
+      recordLabel: `${formula?.name ?? '香方'} · ${materialStore.materialName(item.materialId)}`,
+      formulaId: id
+    }))
+    const { ok } = await applyGuardOutcome(inputs)
     await syncFormulaTotal()
-    return count
+    return ok ? inputs.length : 0
   }
 
   return {
@@ -256,6 +377,8 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     checkMessage,
     loading,
     error,
+    blockedByConflict,
+    queuedOffline,
     add,
     update,
     remove,

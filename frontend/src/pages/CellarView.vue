@@ -11,7 +11,6 @@ import { useCellarStore, parseDate } from '@/stores/cellarStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
-import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
 import {
   CELLAR_CONTAINERS,
@@ -261,10 +260,15 @@ async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  // 出窖登记闸门：旧快照待复核批次，未复核前不许按新配比登记出窖
+  if (form.state === '已出窖' && cellarStore.isBatchPendingReview(form.batchId)) {
+    ElMessage.error('该批次旧快照待复核，复核通过前不能登记出窖')
+    return
+  }
   submitting.value = true
   try {
     if (editingId.value) {
-      await cellarStore.updateCellar(editingId.value, {
+      const result = await cellarStore.updateCellar(editingId.value, {
         batchId: form.batchId,
         startDate: form.startDate,
         endDate: form.endDate,
@@ -273,9 +277,10 @@ async function submitForm(): Promise<void> {
         container: form.container,
         state: form.state
       })
-      ElMessage.success('窖藏环境记录已更新')
+      if (result.blocked) return
+      ElMessage.success(result.queued ? '浏览器离线，窖藏改动已暂存，重连后自动合并' : '窖藏环境记录已更新')
     } else {
-      await cellarStore.createCellar({
+      const result = await cellarStore.createCellar({
         batchId: form.batchId,
         startDate: form.startDate,
         endDate: form.endDate,
@@ -284,7 +289,8 @@ async function submitForm(): Promise<void> {
         container: form.container,
         state: form.state
       })
-      ElMessage.success('已登记窖藏批次，临近出窖会自动提醒')
+      if (result.blocked) return
+      ElMessage.success(result.queued ? '浏览器离线，窖藏登记已暂存，重连后自动合并' : '已登记窖藏批次，临近出窖会自动提醒')
     }
     dialogVisible.value = false
   } finally {
@@ -293,20 +299,39 @@ async function submitForm(): Promise<void> {
 }
 
 async function advanceState(row: CellarRow): Promise<void> {
-  const next = await cellarStore.advanceState(row.cellar.id)
-  if (next) ElMessage.success(`「${row.formulaName}」已流转为「${next}」`)
+  const result = await cellarStore.advanceState(row.cellar.id)
+  if (result.blocked) {
+    ElMessageBox.alert(
+      '该批次的旧配比快照待复核：请先到「和香批次」打开快照对照并复核通过，之后才能按新配比登记出窖。',
+      '旧快照待复核，暂不能出窖',
+      { type: 'warning', confirmButtonText: '知道了' }
+    ).catch(() => undefined)
+    return
+  }
+  if (result.next) {
+    ElMessage.success(
+      result.queued
+        ? '浏览器离线，出窖操作已暂存，重连后自动合并'
+        : `「${row.formulaName}」已流转为「${result.next}」`
+    )
+  }
 }
 
 async function setState(row: CellarRow, state: CellarState): Promise<void> {
   if (row.cellar.state === state) return
-  await cellarStore.setState(row.cellar.id, state)
-  ElMessage.success(`已置为「${state}」`)
+  const result = await cellarStore.setState(row.cellar.id, state)
+  if (result.blocked) {
+    ElMessage.error('旧快照待复核，复核通过前不能登记出窖')
+    return
+  }
+  ElMessage.success(result.queued ? '浏览器离线，状态改动已暂存，重连后自动合并' : `已置为「${state}」`)
 }
 
 async function updateReading(row: CellarRow, field: 'temperatureC' | 'humidityPct', value: number): Promise<void> {
   const next = round(value, 1)
   if (next === row.cellar[field]) return
-  await cellarStore.updateCellar(row.cellar.id, { [field]: next } as Partial<Cellar>)
+  const result = await cellarStore.updateCellar(row.cellar.id, { [field]: next } as Partial<Cellar>)
+  if (result.blocked) return
   const outOfRange = field === 'temperatureC' ? next < 18 || next > 26 : next < 50 || next > 70
   ElMessage({
     type: outOfRange ? 'warning' : 'success',
@@ -324,21 +349,38 @@ async function removeCellar(row: CellarRow): Promise<void> {
     { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  await cellarStore.removeCellar(row.cellar.id)
+  const result = await cellarStore.removeCellar(row.cellar.id)
+  if (result.blocked || result.queued) return
   ElMessage.success('窖藏记录已删除')
 }
 
 async function releaseOverdue(): Promise<void> {
-  const count = await cellarStore.releaseOverdue()
-  if (count === 0) {
+  const { released, skippedPending } = await cellarStore.releaseOverdue()
+  if (released === 0 && skippedPending === 0) {
     ElMessage.info('当前没有逾期的在窖批次')
     return
   }
-  ElMessage.success(`已将 ${count} 个逾期批次置为「已出窖」`)
+  if (released === 0 && skippedPending > 0) {
+    ElMessage.warning(`有 ${skippedPending} 个逾期批次的旧快照待复核，复核通过前不能登记出窖`)
+    return
+  }
+  ElMessage.success(
+    `已将 ${released} 个逾期批次置为「已出窖」` +
+      (skippedPending > 0 ? `；另跳过 ${skippedPending} 个待复核批次` : '')
+  )
 }
 
 async function goTasting(row: CellarRow): Promise<void> {
-  await db.batches.update(row.cellar.batchId, { updatedAt: Date.now() })
+  if (cellarStore.isBatchPendingReview(row.cellar.batchId)) {
+    ElMessageBox.alert(
+      '该批次的旧配比快照待复核：请先到「和香批次」复核通过，才能登记品香（复核前品香均分不计入香方）。',
+      '旧快照待复核，暂不能品香',
+      { type: 'warning', confirmButtonText: '去批次页复核' }
+    )
+      .then(() => router.push('/batches'))
+      .catch(() => undefined)
+    return
+  }
   void router.push({ path: '/tastings', query: { batch: row.cellar.batchId } })
 }
 
@@ -408,6 +450,20 @@ const formingText = (batchId: string): FormingMethod | '—' =>
       :title="`环境超限 ${cellarStore.environmentWarning.length} 条（建议 18~26 ℃ / 50~70%）`"
     />
 
+    <el-alert
+      v-if="cellarStore.pendingReviewCount > 0"
+      class="cellar-alert"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="`${cellarStore.pendingReviewCount} 个批次的旧配比快照待复核`"
+      description="香方配比改动后旧快照立即失效；未复核通过前不能按新配比登记出窖，相关品香均分也暂不计入香方。请先到「和香批次」复核。"
+    >
+      <template #default>
+        <el-button size="small" type="warning" plain @click="router.push('/batches')">前往批次页复核</el-button>
+      </template>
+    </el-alert>
+
     <FilterBar
       :model-value="filterModel"
       :selects="filterSelects"
@@ -438,6 +494,14 @@ const formingText = (batchId: string): FormingMethod | '—' =>
               {{ formingText(row.cellar.batchId) }} · {{ row.quantity }} 支 · 配比
               {{ batchFormulaMaterialCount(row.cellar.batchId) }} 味
             </div>
+            <el-tag
+              v-if="cellarStore.isBatchPendingReview(row.cellar.batchId)"
+              type="danger"
+              size="small"
+              effect="dark"
+            >
+              旧方快照待复核
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="窖藏天数" width="150">
@@ -563,7 +627,16 @@ const formingText = (batchId: string): FormingMethod | '—' =>
           </el-select>
         </el-form-item>
         <el-alert
-          v-if="watchedFormulaId"
+          v-if="watchedFormulaId && cellarStore.isBatchPendingReview(form.batchId)"
+          class="ratio-alert"
+          type="error"
+          :closable="false"
+          show-icon
+          title="该批次旧配比快照待复核"
+          description="请先到「和香批次」打开快照对照并复核通过；未复核前该批次不能按新配比登记出窖，品香均分也暂不计入香方。"
+        />
+        <el-alert
+          v-else-if="watchedFormulaId"
           class="ratio-alert"
           :type="ratioLevel === 'ok' ? 'success' : ratioLevel === 'warn' ? 'warning' : 'error'"
           :closable="false"

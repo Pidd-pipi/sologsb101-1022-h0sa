@@ -1,7 +1,8 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import { db } from '@/utils/db'
+import { createId } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { useSyncGuard } from '@/hooks/useSyncGuard'
 import {
   createEmptyMaterialFilter,
   GRADE_WEIGHT,
@@ -11,6 +12,7 @@ import {
   type ProcessMethod
 } from '@/types/material'
 import type { Proportion, ProportionRole } from '@/types/proportion'
+import type { LocalEditInput } from '@/types/sync'
 
 /** 香料库一行：香料 + 被引用情况 */
 export interface MaterialRow {
@@ -34,6 +36,7 @@ export const useMaterialStore = defineStore('material', () => {
   const proportionTable = useIdbTable<Proportion>((database) => database.proportions, {
     sortByUpdatedAt: false
   })
+  const guard = useSyncGuard()
 
   const filter = ref<MaterialFilterState>(createEmptyMaterialFilter())
   const processMethodDictionary = ref<ProcessMethod[]>(['生用', '酒蒸', '蜜炙', '炒黄', '醋浸'])
@@ -162,42 +165,104 @@ export const useMaterialStore = defineStore('material', () => {
     aromaNote: string
     createdAt: string
   }): Promise<Material> {
-    return materialTable.create(
-      {
-        name: payload.name.trim(),
-        origin: payload.origin.trim(),
-        grade: payload.grade,
-        processMethod: payload.processMethod,
-        aromaNote: payload.aromaNote.trim(),
-        createdAt: payload.createdAt
+    const record: Material = {
+      id: createId('material'),
+      name: payload.name.trim(),
+      origin: payload.origin.trim(),
+      grade: payload.grade,
+      processMethod: payload.processMethod,
+      aromaNote: payload.aromaNote.trim(),
+      createdAt: payload.createdAt,
+      updatedAt: Date.now()
+    }
+    await guard.save({
+      table: 'materials',
+      recordId: record.id,
+      kind: 'create',
+      nextFields: {
+        name: record.name,
+        origin: record.origin,
+        grade: record.grade,
+        processMethod: record.processMethod,
+        aromaNote: record.aromaNote,
+        createdAt: record.createdAt
       },
-      'material'
-    )
+      recordLabel: record.name,
+      formulaId: null
+    })
+    return record
   }
 
   async function updateMaterial(id: string, patch: Partial<Material>): Promise<void> {
-    await materialTable.update(id, patch)
+    const current = materialById(id)
+    const baseFields: Record<string, unknown> = {}
+    Object.keys(patch).forEach((field) => {
+      if (field === 'updatedAt') return
+      baseFields[field] = (current as unknown as Record<string, unknown> | undefined)?.[field]
+    })
+    await guard.save({
+      table: 'materials',
+      recordId: id,
+      kind: 'update',
+      baseFields,
+      nextFields: patch as Record<string, unknown>,
+      recordLabel: current?.name ?? '香料',
+      formulaId: null
+    })
   }
 
-  /** 更新炮制方式并同步到字典 */
+  /** 更新炮制方式并同步到字典（走守卫，避免覆盖另一标签页的同名改动） */
   async function setProcessMethod(id: string, processMethod: ProcessMethod): Promise<void> {
-    await materialTable.update(id, { processMethod })
+    const current = materialById(id)
+    await guard.save({
+      table: 'materials',
+      recordId: id,
+      kind: 'update',
+      baseFields: { processMethod: current?.processMethod },
+      nextFields: { processMethod },
+      recordLabel: current?.name ?? '香料',
+      formulaId: null
+    })
     if (!processMethodDictionary.value.includes(processMethod)) {
       processMethodDictionary.value = [...processMethodDictionary.value, processMethod]
     }
   }
 
-  /** 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化） */
+  /** 删除香料：同时级联删除引用它的配比记录（配比合计变化会让相关香方批次旧快照待复核） */
   async function removeMaterial(
     id: string
   ): Promise<{ proportions: number; formulaIds: string[] }> {
     const list = proportionsByMaterial.value[id] ?? []
+    const material = materials.value.find((item) => item.id === id)
     const proportionIds = list.map((item) => item.id)
     const formulaIds = Array.from(new Set(list.map((item) => item.formulaId)))
-    await db.transaction('rw', [db.materials, db.proportions], async () => {
-      await db.proportions.bulkDelete(proportionIds)
-      await db.materials.delete(id)
-    })
+    const inputs: LocalEditInput[] = [
+      ...list.map((proportion) => ({
+        table: 'proportions' as const,
+        recordId: proportion.id,
+        kind: 'delete' as const,
+        baseFields: {
+          materialId: proportion.materialId,
+          ratio: proportion.ratio,
+          role: proportion.role
+        },
+        nextFields: {},
+        recordLabel: `${material?.name ?? '香料'} 配比`,
+        formulaId: proportion.formulaId
+      })),
+      {
+        table: 'materials' as const,
+        recordId: id,
+        kind: 'delete' as const,
+        baseFields: material
+          ? { name: material.name, grade: material.grade, processMethod: material.processMethod }
+          : {},
+        nextFields: {},
+        recordLabel: material?.name ?? '香料',
+        formulaId: null
+      }
+    ]
+    await guard.run(inputs)
     return { proportions: proportionIds.length, formulaIds }
   }
 

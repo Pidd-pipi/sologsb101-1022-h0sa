@@ -12,6 +12,7 @@ import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
+import { useSyncGuard } from '@/hooks/useSyncGuard'
 import { db } from '@/utils/db'
 import { round } from '@/utils/ratio'
 import {
@@ -31,8 +32,12 @@ const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
 const batchTable = useIdbTable<Batch>((database) => database.batches)
-/** 用 useProportion 校验和香前的配比合计，避免用未平衡的方子开批次 */
-const { rows: selectedProportionRows, total: selectedRatioTotal, checkLevel, checkMessage } = useProportion()
+/** 用 useProportion 校验和香前的配比合计，绑定登记表单当前选择的香方，避免用未平衡的方子开批次 */
+const dialogFormulaId = computed(() => form.formulaId || null)
+const { rows: selectedProportionRows, total: selectedRatioTotal, checkLevel, checkMessage } = useProportion({
+  formulaId: dialogFormulaId
+})
+const guard = useSyncGuard()
 
 const filter = ref<BatchFilterState>(createEmptyBatchFilter())
 const dialogVisible = ref(false)
@@ -155,7 +160,8 @@ const rows = computed<BatchRow[]>(() =>
       currentRatioTotal,
       snapshotRatioTotal,
       cellared: cellars.length > 0,
-      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / ')
+      cellarState: cellars.length === 0 ? '未入窖' : cellars.map((cellar) => cellar.state).join(' / '),
+      pendingReview: batch.reviewState === '待复核'
     }
   })
 )
@@ -176,9 +182,7 @@ const filteredRows = computed<BatchRow[]>(() =>
 
 const totalQuantity = computed(() => filteredRows.value.reduce((sum, row) => sum + row.batch.quantity, 0))
 const cellaredCount = computed(() => rows.value.filter((row) => row.cellared).length)
-const driftedCount = computed(() =>
-  rows.value.filter((row) => Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01).length
-)
+const pendingReviewCount = computed(() => rows.value.filter((row) => row.pendingReview).length)
 const averageQuantity = computed(() =>
   rows.value.length === 0 ? 0 : Math.round(rows.value.reduce((sum, row) => sum + row.batch.quantity, 0) / rows.value.length)
 )
@@ -188,15 +192,18 @@ const detailRow = computed<BatchRow | null>(() => rows.value.find((row) => row.b
 /** 香方 id → 配比味数，用于快照对照时回显 */
 const proportionCountMap = computed<Record<string, number>>(() => proportionStore.materialCountMap)
 
-/** 对照快照与当前方子：返回差异说明文案 */
+/** 对照快照与当前方子：返回差异说明文案（含占比与君臣佐使） */
 function snapshotDiff(item: BatchSnapshotItem, row: BatchRow): string {
   const currentItem = proportionStore
     .proportionsByFormula(row.batch.formulaId)
     .find((proportion) => proportion.materialId === item.materialId)
   if (!currentItem) return '已从方中移除'
   const delta = round(currentItem.ratio - item.ratio, 2)
-  if (delta === 0) return '与当前一致'
-  return `当前 ${currentItem.ratio}%（${delta > 0 ? '+' : ''}${delta}%）`
+  const parts: string[] = []
+  if (delta === 0) parts.push('占比一致')
+  else parts.push(`当前占比 ${currentItem.ratio}%（${delta > 0 ? '+' : ''}${delta}%）`)
+  if (currentItem.role !== item.role) parts.push(`君臣佐使 ${item.role} → ${currentItem.role}`)
+  return parts.join('；')
 }
 
 function handleFilterChange(value: FilterModel): void {
@@ -259,33 +266,44 @@ async function submitForm(): Promise<void> {
   if (!formRef.value) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  if (!editingId.value && cellarStore.formulaHasPendingReview(form.formulaId)) {
+    ElMessageBox.alert(
+      '该香方有用中批次的旧快照待复核。请先在「快照对照」中逐项核对并点「复核通过，按当前配比固化」，之后才能按新配比登记新批次。',
+      '存在待复核旧批次',
+      { type: 'warning', confirmButtonText: '去复核' }
+    ).catch(() => undefined)
+    return
+  }
   submitting.value = true
   try {
     if (editingId.value) {
-      await batchTable.update(editingId.value, {
+      const result = await cellarStore.updateBatchMeta(editingId.value, {
         formulaId: form.formulaId,
         mixedAt: form.mixedAt,
         formingMethod: form.formingMethod,
         quantity: form.quantity,
         operator: form.operator.trim()
       })
-      ElMessage.success('批次已更新')
+      if (result.blocked) return
+      ElMessage.success(result.queued ? '浏览器离线，批次改动已暂存，重连后自动合并' : '批次已更新')
     } else {
       const snapshot = await buildSnapshot(form.formulaId)
-      const batch = await batchTable.create(
-        {
-          formulaId: form.formulaId,
-          mixedAt: form.mixedAt,
-          formingMethod: form.formingMethod,
-          quantity: form.quantity,
-          operator: form.operator.trim(),
-          snapshot,
-          snapshotAt: Date.now()
-        },
-        'batch'
+      const result = await cellarStore.registerBatch({
+        formulaId: form.formulaId,
+        mixedAt: form.mixedAt,
+        formingMethod: form.formingMethod,
+        quantity: form.quantity,
+        operator: form.operator.trim(),
+        snapshot
+      })
+      if (result.blockedByReview) return
+      if (result.conflict) return
+      ElMessage.success(
+        result.queued
+          ? '浏览器离线，批次已暂存，重连后自动合并'
+          : `已生成批次，自动带出 ${snapshot.length} 条配比快照，便于追溯改方前后差异`
       )
-      ElMessage.success(`已生成批次，自动带出 ${snapshot.length} 条配比快照，便于追溯改方前后差异`)
-      detailBatchId.value = batch.id
+      if (result.batchId) detailBatchId.value = result.batchId
     }
     dialogVisible.value = false
   } finally {
@@ -301,20 +319,33 @@ async function removeBatch(row: BatchRow): Promise<void> {
     { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
   ).catch(() => false)
   if (!confirmed) return
-  const cellarIds = cellars.map((cellar) => cellar.id)
-  const tastingIds = await db.tastings.where('batchId').equals(row.batch.id).primaryKeys()
-  await db.transaction('rw', [db.batches, db.cellars, db.tastings], async () => {
-    await db.tastings.bulkDelete(tastingIds)
-    await db.cellars.bulkDelete(cellarIds)
-    await db.batches.delete(row.batch.id)
+  const result = await guard.save({
+    table: 'batches',
+    recordId: row.batch.id,
+    kind: 'delete',
+    baseFields: {
+      formulaId: row.batch.formulaId,
+      mixedAt: row.batch.mixedAt,
+      formingMethod: row.batch.formingMethod
+    },
+    nextFields: {},
+    recordLabel: `${row.formulaName} · ${row.batch.mixedAt}`,
+    formulaId: row.batch.formulaId
   })
-  ElMessage.success(`已删除批次，连带清除窖藏 ${cellarIds.length} 条、品香 ${tastingIds.length} 条`)
+  if (result.conflicts.length > 0 || result.queued) return
+  ElMessage.success(`已删除批次，连带清除窖藏 ${cellars.length} 条与关联品香记录`)
 }
 
-async function refreshSnapshot(row: BatchRow): Promise<void> {
+/** 复核通过：唯一允许按当前配比重新固化旧快照的入口 */
+async function reviewSnapshot(row: BatchRow): Promise<void> {
   const snapshot = await buildSnapshot(row.batch.formulaId)
-  await batchTable.update(row.batch.id, { snapshot, snapshotAt: Date.now() })
-  ElMessage.success('已按当前配比重置快照')
+  const result = await cellarStore.reviewBatchSnapshot(row.batch.id, snapshot)
+  if (result.blocked) return
+  ElMessage.success(
+    result.queued
+      ? '浏览器离线，复核已暂存，重连后自动合并'
+      : '复核通过，已按当前配比重新固化快照，该批次可正常出窖 / 品香'
+  )
 }
 
 function openDetail(row: BatchRow): void {
@@ -339,8 +370,8 @@ function goProportion(row: BatchRow): void {
       <div>
         <h2>和香工序与成型登记</h2>
         <p>
-          共 {{ rows.length }} 个批次 · 已入窖 {{ cellaredCount }} 个 · 配比改动 {{ driftedCount }} 个 · 当前筛选
-          {{ filteredRows.length }} 个
+          共 {{ rows.length }} 个批次 · 已入窖 {{ cellaredCount }} 个 · 待复核旧快照
+          {{ pendingReviewCount }} 个 · 当前筛选 {{ filteredRows.length }} 个
         </p>
       </div>
       <div class="page-title__actions">
@@ -350,9 +381,8 @@ function goProportion(row: BatchRow): void {
 
     <div class="stat-row">
       <StatBadge label="批次总数" :value="rows.length" suffix="个" icon="Box" tone="primary" />
-      <StatBadge label="筛选中数量" :value="totalQuantity" suffix="支/丸" icon="Histogram" tone="info" />
-      <StatBadge label="已入窖" :value="cellaredCount" suffix="个" icon="Coin" tone="success" />
-      <StatBadge label="配比已改动" :value="driftedCount" suffix="个" icon="Document" tone="warning" hint="当前配比合计与批次快照不一致" />
+      <StatBadge label="筛选中数量" :value="totalQuantity" suffix="支/丸" icon="Histogram" tone="info" />      <StatBadge label="已入窖" :value="cellaredCount" suffix="个" icon="Coin" tone="success" />
+      <StatBadge label="待复核旧快照" :value="pendingReviewCount" suffix="个" icon="WarningFilled" tone="danger" hint="香方配比已改动，复核通过前不得按新配比出窖 / 品香" />
       <StatBadge label="平均产量" :value="averageQuantity" suffix="支/丸" icon="TrendCharts" tone="default" />
     </div>
 
@@ -394,15 +424,16 @@ function goProportion(row: BatchRow): void {
           </template>
         </el-table-column>
         <el-table-column label="制香人" prop="batch.operator" width="120" />
-        <el-table-column label="配比对照" min-width="190">
+        <el-table-column label="配比对照" min-width="210">
           <template #default="{ row }: { row: BatchRow }">
             <div class="cell-sub">
               快照合计 <span class="mono">{{ row.snapshotRatioTotal }}%</span> · 当前合计
               <span class="mono">{{ row.currentRatioTotal }}%</span>
             </div>
-            <div class="cell-sub" :class="Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01 ? 'ratio-error' : 'ratio-ok'">
-              {{ Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01 ? '改方后配比已变化' : '配比与快照一致' }}
-            </div>
+            <el-tag v-if="row.pendingReview" type="danger" size="small" effect="dark" round>
+              旧快照待复核
+            </el-tag>
+            <div v-else class="cell-sub ratio-ok">配比与快照一致</div>
           </template>
         </el-table-column>
         <el-table-column label="窖藏状态" width="140">
@@ -450,7 +481,16 @@ function goProportion(row: BatchRow): void {
           <el-input v-model="form.operator" placeholder="如：林砚舟" maxlength="20" />
         </el-form-item>
         <el-alert
-          v-if="form.formulaId"
+          v-if="form.formulaId && cellarStore.formulaHasPendingReview(form.formulaId)"
+          class="ratio-alert"
+          type="error"
+          :closable="false"
+          show-icon
+          title="该香方有用中批次的旧快照待复核"
+          description="未复核通过前不能按新配比登记新批次；请先关闭本窗，到「快照对照」逐项核对并复核通过。"
+        />
+        <el-alert
+          v-else-if="form.formulaId"
           class="ratio-alert"
           :type="checkLevel === 'ok' ? 'success' : checkLevel === 'warn' ? 'warning' : 'error'"
           :closable="false"
@@ -476,6 +516,15 @@ function goProportion(row: BatchRow): void {
             {{ detailRow.batch.operator }}
           </p>
           <p class="muted">快照固化于 {{ new Date(detailRow.batch.snapshotAt || Date.now()).toLocaleString('zh-CN') }}</p>
+          <el-alert
+            v-if="detailRow.pendingReview"
+            class="review-alert"
+            type="error"
+            show-icon
+            :closable="false"
+            title="香方配比已改动，此份旧快照已失效并待复核"
+            description="未复核通过前，该批次不得按新配比登记出窖，其上的品香均分也暂不计入香方。请逐项核对下列差异，确认后点「复核通过，按当前配比固化」。"
+          />
         </div>
 
         <div class="snapshot-badges">
@@ -493,21 +542,32 @@ function goProportion(row: BatchRow): void {
 
         <el-table :data="detailRow.batch.snapshot" size="small" row-key="materialId">
           <el-table-column label="香料" prop="materialName" min-width="120" />
-          <el-table-column label="角色" prop="role" width="70" />
+          <el-table-column label="角色" width="70" />
           <el-table-column label="快照占比" width="100">
             <template #default="{ row }: { row: BatchSnapshotItem }">
               <span class="mono">{{ row.ratio }}%</span>
             </template>
           </el-table-column>
-          <el-table-column label="与当前对比" min-width="140">
+          <el-table-column label="与当前对比" min-width="160">
             <template #default="{ row }: { row: BatchSnapshotItem }">
               <span class="cell-sub">{{ snapshotDiff(row, detailRow) }}</span>
             </template>
           </el-table-column>
         </el-table>
 
+        <el-alert
+          v-if="detailRow.pendingReview"
+          class="review-tip"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="复核即代表确认按当前香方的新配比追溯该批次；旧快照差异见上表与当前配比页。"
+        />
+
         <div class="snapshot-actions">
-          <el-button :icon="Document" @click="refreshSnapshot(detailRow)">按当前配比重置快照</el-button>
+          <el-button v-if="detailRow.pendingReview" type="primary" :icon="Document" @click="reviewSnapshot(detailRow)">
+            复核通过，按当前配比固化
+          </el-button>
           <el-button :icon="Histogram" @click="goProportion(detailRow)">去改配比</el-button>
         </div>
       </template>
@@ -561,5 +621,13 @@ function goProportion(row: BatchRow): void {
   display: flex;
   gap: 8px;
   margin-top: 16px;
+}
+
+.review-alert {
+  margin-top: 10px;
+}
+
+.review-tip {
+  margin-top: 12px;
 }
 </style>

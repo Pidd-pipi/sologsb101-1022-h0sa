@@ -7,6 +7,7 @@ import {
   importSnapshot,
   type IncenseSnapshot
 } from '@/utils/db'
+import { reconcileImportedReviewStates } from '@/utils/snapshot'
 import {
   FORMULA_STATES,
   SCENT_TYPES,
@@ -308,6 +309,9 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
           }))
         : [],
       snapshotAt: asNumber(raw.snapshotAt, 0),
+      reviewState: raw.reviewState === '待复核' ? '待复核' : '正常',
+      staleAt: asNumber(raw.staleAt, 0),
+      reviewedAt: asNumber(raw.reviewedAt, 0),
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })
@@ -438,6 +442,9 @@ export async function importFormulaPayload(
       ...batch,
       id,
       formulaId,
+      reviewState: batch.reviewState ?? '正常',
+      staleAt: batch.staleAt ?? 0,
+      reviewedAt: batch.reviewedAt ?? 0,
       snapshot: batch.snapshot.map((item) => ({
         ...item,
         materialId: materialIdMap.get(item.materialId) ?? item.materialId
@@ -487,12 +494,19 @@ export async function importFormulaPayload(
   }
 }
 
-/** 覆盖式导入全量快照 */
+/** 覆盖式导入全量快照；导入后按当前配比给旧档案批次补版本（旧快照不一致即待复核） */
 export async function importSnapshotPayload(
   snapshot: IncenseSnapshot,
   overwrite: boolean
 ): Promise<Record<string, number>> {
   await importSnapshot(snapshot, overwrite)
+  const proportionsByFormula = new Map<string, IncenseSnapshot['proportions']>()
+  snapshot.proportions.forEach((proportion) => {
+    const list = proportionsByFormula.get(proportion.formulaId) ?? []
+    list.push(proportion)
+    proportionsByFormula.set(proportion.formulaId, list)
+  })
+  await reconcileImportedReviewStates(proportionsByFormula, Date.now())
   return {
     formulas: snapshot.formulas.length,
     materials: snapshot.materials.length,
