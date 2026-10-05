@@ -195,7 +195,8 @@ export const useFormulaStore = defineStore('formula', () => {
         usage: payload.usage,
         createdAt: payload.createdAt,
         totalRatio: 0,
-        state: payload.state ?? '草稿'
+        state: payload.state ?? '草稿',
+        version: 1
       },
       'formula'
     )
@@ -259,7 +260,8 @@ export const useFormulaStore = defineStore('formula', () => {
         usage: source.usage,
         createdAt: new Date().toISOString().slice(0, 10),
         totalRatio: source.totalRatio,
-        state: '草稿'
+        state: '草稿',
+        version: 1
       },
       'formula'
     )

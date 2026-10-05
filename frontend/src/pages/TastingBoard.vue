@@ -8,6 +8,7 @@ import FilterBar, { type FilterModel } from '@/components/common/FilterBar.vue'
 import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useFormulaStore } from '@/stores/formulaStore'
+import { useCollabStore } from '@/stores/collabStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { DB_VERSION, readLastBackupAt, resetDatabase } from '@/utils/db'
 import {
@@ -32,6 +33,7 @@ import {
 const route = useRoute()
 const router = useRouter()
 const formulaStore = useFormulaStore()
+const collabStore = useCollabStore()
 const tastingTable = useIdbTable<Tasting>((database) => database.tastings)
 const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
 
@@ -299,6 +301,12 @@ async function submitForm(): Promise<void> {
       })
       ElMessage.success('品香记录已更新，均分已同步到香方台账')
     } else {
+      const targetBatch = batchMap.value[form.batchId]
+      if (targetBatch && !collabStore.requireReviewed(targetBatch)) {
+        ElMessage.warning('该批次快照待复核，复核通过后才能录品香，避免均分归错香方')
+        submitting.value = false
+        return
+      }
       await tastingTable.create(
         {
           batchId: form.batchId,

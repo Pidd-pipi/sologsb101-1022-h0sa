@@ -10,6 +10,7 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
+import { useCollabStore } from '@/stores/collabStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
@@ -30,6 +31,7 @@ const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
+const collabStore = useCollabStore()
 const batchTable = useIdbTable<Batch>((database) => database.batches)
 /** 用 useProportion 校验和香前的配比合计，避免用未平衡的方子开批次 */
 const { rows: selectedProportionRows, total: selectedRatioTotal, checkLevel, checkMessage } = useProportion()
@@ -272,6 +274,7 @@ async function submitForm(): Promise<void> {
       ElMessage.success('批次已更新')
     } else {
       const snapshot = await buildSnapshot(form.formulaId)
+      const formula = formulaStore.formulaById(form.formulaId)
       const batch = await batchTable.create(
         {
           formulaId: form.formulaId,
@@ -280,7 +283,9 @@ async function submitForm(): Promise<void> {
           quantity: form.quantity,
           operator: form.operator.trim(),
           snapshot,
-          snapshotAt: Date.now()
+          snapshotAt: Date.now(),
+          snapshotVersion: formula?.version ?? 1,
+          snapshotStatus: 'current'
         },
         'batch'
       )
@@ -313,8 +318,16 @@ async function removeBatch(row: BatchRow): Promise<void> {
 
 async function refreshSnapshot(row: BatchRow): Promise<void> {
   const snapshot = await buildSnapshot(row.batch.formulaId)
-  await batchTable.update(row.batch.id, { snapshot, snapshotAt: Date.now() })
-  ElMessage.success('已按当前配比重置快照')
+  const formula = formulaStore.formulaById(row.batch.formulaId)
+  await batchTable.update(row.batch.id, {
+    snapshot,
+    snapshotAt: Date.now(),
+    snapshotVersion: formula?.version ?? row.batch.snapshotVersion,
+    snapshotStatus: 'current',
+    reviewedAt: Date.now(),
+    reviewNote: '已按当前配比刷新快照'
+  })
+  ElMessage.success('已按当前配比重置快照，批次解除待复核')
 }
 
 function openDetail(row: BatchRow): void {
@@ -403,6 +416,22 @@ function goProportion(row: BatchRow): void {
             <div class="cell-sub" :class="Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01 ? 'ratio-error' : 'ratio-ok'">
               {{ Math.abs(row.currentRatioTotal - row.snapshotRatioTotal) > 0.01 ? '改方后配比已变化' : '配比与快照一致' }}
             </div>
+            <el-tag
+              v-if="row.batch.snapshotStatus === 'stale' && !row.batch.reviewedAt"
+              size="small"
+              type="warning"
+              effect="dark"
+              round
+              class="review-tag"
+            >待复核</el-tag>
+            <el-tag
+              v-else-if="row.batch.snapshotStatus === 'stale' && row.batch.reviewedAt"
+              size="small"
+              type="info"
+              effect="plain"
+              round
+              class="review-tag"
+            >已复核旧快照</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="窖藏状态" width="140">
@@ -410,8 +439,15 @@ function goProportion(row: BatchRow): void {
             <el-tag :type="row.cellared ? 'success' : 'info'" effect="plain" round>{{ row.cellarState }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="300" fixed="right">
+        <el-table-column label="操作" width="360" fixed="right">
           <template #default="{ row }: { row: BatchRow }">
+            <el-button
+              v-if="row.batch.snapshotStatus === 'stale' && !row.batch.reviewedAt"
+              size="small"
+              type="warning"
+              text
+              @click="collabStore.openReview(row.batch.id)"
+            >复核快照</el-button>
             <el-button size="small" text type="primary" :icon="Document" @click="openDetail(row)">快照对照</el-button>
             <el-button size="small" text @click="goCellar(row)">窖藏</el-button>
             <el-button size="small" text :icon="Edit" @click="openEdit(row.batch)">编辑</el-button>
@@ -540,6 +576,10 @@ function goProportion(row: BatchRow): void {
 
 .ratio-alert {
   margin-bottom: 12px;
+}
+
+.review-tag {
+  margin-top: 4px;
 }
 
 .snapshot-head h3 {

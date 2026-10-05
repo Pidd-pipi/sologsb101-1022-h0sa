@@ -5,9 +5,11 @@ import type { Proportion } from '@/types/proportion'
 import type { Batch } from '@/types/batch'
 import type { Cellar } from '@/types/cellar'
 import type { Tasting } from '@/types/tasting'
+import type { PendingConflict } from '@/types/collab'
+import { round } from '@/utils/ratio'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -51,6 +53,8 @@ export class IncenseDatabase extends Dexie {
   batches!: Table<Batch, string>
   cellars!: Table<Cellar, string>
   tastings!: Table<Tasting, string>
+  /** 多标签页协同：待逐项确认的配比冲突（未确认草稿原样保留在此） */
+  conflicts!: Table<PendingConflict, string>
 
   constructor() {
     super('gbincense')
@@ -64,7 +68,7 @@ export class IncenseDatabase extends Dexie {
       tastings: 'id, batchId, tastedAt, smokeScore'
     })
     // v2：配比表补 seq 索引、批次与窖藏补日期索引，并回填历史脏数据
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, updatedAt',
         materials: 'id, name, origin, grade, processMethod, updatedAt',
@@ -108,6 +112,54 @@ export class IncenseDatabase extends Dexie {
             }
           })
       })
+    // v3：补配方版本号与批次快照版本 / 待复核状态，并新增冲突队列表
+    this.version(DB_VERSION)
+      .stores({
+        formulas: 'id, name, scentType, usage, state, createdAt, totalRatio, version, updatedAt',
+        materials: 'id, name, origin, grade, processMethod, updatedAt',
+        proportions: 'id, formulaId, materialId, role, seq, updatedAt',
+        batches: 'id, formulaId, mixedAt, formingMethod, snapshotStatus, updatedAt',
+        cellars: 'id, batchId, startDate, endDate, state, updatedAt',
+        tastings: 'id, batchId, tastedAt, smokeScore, updatedAt',
+        conflicts: 'id, formulaId, status, createdAt, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移 4：旧档案补版本号。香方 version=1；批次 snapshotVersion=1，
+        // 并按当前配比回填快照状态（一致 → current，漂移 → stale 待复核）。
+        const allProportions = await tx.table<Proportion>('proportions').toArray()
+        const byFormula = new Map<string, Proportion[]>()
+        allProportions.forEach((proportion) => {
+          const list = byFormula.get(proportion.formulaId) ?? []
+          list.push(proportion)
+          byFormula.set(proportion.formulaId, list)
+        })
+        await tx
+          .table<Formula>('formulas')
+          .toCollection()
+          .modify((formula) => {
+            if (typeof formula.version !== 'number' || Number.isNaN(formula.version)) {
+              formula.version = 1
+            }
+          })
+        await tx
+          .table<Batch>('batches')
+          .toCollection()
+          .modify((batch) => {
+            if (typeof batch.snapshotVersion !== 'number' || Number.isNaN(batch.snapshotVersion)) {
+              batch.snapshotVersion = 1
+            }
+            if (!Array.isArray(batch.snapshot)) batch.snapshot = []
+            const current = byFormula.get(batch.formulaId) ?? []
+            const matches =
+              batch.snapshot.length === current.length &&
+              batch.snapshot.every((item) => {
+                const row = current.find((candidate) => candidate.materialId === item.materialId)
+                if (!row) return false
+                return round(item.ratio, 2) === round(row.ratio, 2) && item.role === row.role
+              })
+            batch.snapshotStatus = matches ? 'current' : 'stale'
+          })
+      })
   }
 }
 
@@ -123,7 +175,7 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings],
+    [db.formulas, db.materials, db.proportions, db.batches, db.cellars, db.tastings, db.conflicts],
     async () => {
       await Promise.all([
         db.formulas.clear(),
@@ -131,7 +183,8 @@ export async function clearAllTables(): Promise<void> {
         db.proportions.clear(),
         db.batches.clear(),
         db.cellars.clear(),
-        db.tastings.clear()
+        db.tastings.clear(),
+        db.conflicts.clear()
       ])
     }
   )
@@ -280,6 +333,7 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-03-12',
       totalRatio: 100,
       state: '在用',
+      version: 1,
       updatedAt: now
     },
     {
@@ -290,6 +344,7 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-05-08',
       totalRatio: 100,
       state: '在用',
+      version: 1,
       updatedAt: now
     },
     {
@@ -300,6 +355,7 @@ export async function seedDatabase(): Promise<void> {
       createdAt: '2024-08-21',
       totalRatio: 0,
       state: '草稿',
+      version: 1,
       updatedAt: now
     }
   ]
@@ -389,6 +445,8 @@ export async function seedDatabase(): Promise<void> {
       operator: '林砚舟',
       snapshot: toSnapshot(lineRatio),
       snapshotAt: new Date('2024-04-01T09:00:00').getTime(),
+      snapshotVersion: 1,
+      snapshotStatus: 'current',
       updatedAt: now
     },
     {
@@ -400,6 +458,8 @@ export async function seedDatabase(): Promise<void> {
       operator: '周若谷',
       snapshot: toSnapshot(pillRatio),
       snapshotAt: new Date('2024-06-15T14:30:00').getTime(),
+      snapshotVersion: 1,
+      snapshotStatus: 'current',
       updatedAt: now
     }
   ]

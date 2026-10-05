@@ -17,6 +17,8 @@ export interface Formula {
   totalRatio: number
   /** 配方状态：草稿/在用/停用 */
   state: FormulaState
+  /** 配方版本号：配比内容每改动一次自增，批次快照据此标记新旧 */
+  version: number
   updatedAt: number
 }
 

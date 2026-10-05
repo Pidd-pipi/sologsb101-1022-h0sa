@@ -7,6 +7,9 @@ import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useCellarStore } from '@/stores/cellarStore'
+import { useCollabStore } from '@/stores/collabStore'
+import ConflictCenter from '@/components/collab/ConflictCenter.vue'
+import SnapshotReviewDialog from '@/components/collab/SnapshotReviewDialog.vue'
 import { DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -15,6 +18,10 @@ const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
 const cellarStore = useCellarStore()
+const collabStore = useCollabStore()
+
+// 启动协同：跨标签页心跳、冲突队列与在线状态
+collabStore.init()
 
 interface NavItem {
   path: string
@@ -107,6 +114,14 @@ function go(path: string): void {
           <em class="app-nav__badge">{{ item.badge }}</em>
         </button>
       </nav>
+
+      <div class="app-collab">
+        <span class="app-collab__presence" :title="collabStore.online ? '在线，可与其它标签页协同' : '离线，重连后自动合并'">
+          <i class="app-collab__dot" :class="{ 'is-online': collabStore.online }"></i>
+          在线 {{ collabStore.activeTabCount }}
+        </span>
+        <ConflictCenter />
+      </div>
     </header>
 
     <main class="app-main">
@@ -125,8 +140,13 @@ function go(path: string): void {
         <template v-if="cellarStore.alerts.length > 0">
           · 临近出窖 {{ cellarStore.alerts.length }} 批
         </template>
+        <template v-if="collabStore.pendingConflictCount > 0">
+          · 待处理协同冲突 {{ collabStore.pendingConflictCount }} 项
+        </template>
       </span>
     </footer>
+
+    <SnapshotReviewDialog />
   </div>
 </template>
 
@@ -215,6 +235,33 @@ function go(path: string): void {
   padding: 0 6px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.18);
+}
+
+.app-collab {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.app-collab__presence {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: rgba(247, 240, 228, 0.85);
+  white-space: nowrap;
+}
+
+.app-collab__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #c0392b;
+}
+
+.app-collab__dot.is-online {
+  background: #7fd69a;
+  box-shadow: 0 0 0 3px rgba(127, 214, 154, 0.25);
 }
 
 .app-main {

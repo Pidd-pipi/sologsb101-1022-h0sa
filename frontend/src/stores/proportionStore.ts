@@ -2,6 +2,8 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { tabBus, tabId } from '@/utils/tabBus'
+import { snapshotMatches } from '@/utils/merge'
 import {
   createEmptyProportionFilter,
   PROPORTION_ROLES,
@@ -226,6 +228,56 @@ export const useProportionStore = defineStore('proportion', () => {
     setSortMode('manual')
   }
 
+  /**
+   * 配比内容整组提交（多标签页协同的唯一落库入口）：
+   * 删除本次不再包含的配比行，bulkPut 保留 / 新增行；回写香方合计并自增配方版本号；
+   * 快照已漂移的批次标记为「待复核」；广播通知其它标签页。返回 seq 重排后的配比行。
+   */
+  async function replaceProportionSet(
+    formulaId: string,
+    rows: Proportion[],
+    options: { silent?: boolean } = {}
+  ): Promise<Proportion[]> {
+    const now = Date.now()
+    const toWrite: Proportion[] = rows.map((row, index) => ({
+      ...row,
+      formulaId,
+      seq: index + 1,
+      updatedAt: now
+    }))
+    await db.transaction('rw', [db.formulas, db.proportions, db.batches], async () => {
+      const existingIds = await db.proportions.where('formulaId').equals(formulaId).primaryKeys()
+      const keepIds = new Set(toWrite.map((row) => row.id))
+      const removeIds = existingIds.filter((id) => !keepIds.has(id))
+      if (removeIds.length > 0) await db.proportions.bulkDelete(removeIds)
+      if (toWrite.length > 0) await db.proportions.bulkPut(toWrite)
+
+      const total = sumRatios(toWrite.map((row) => row.ratio))
+      const formula = await db.formulas.get(formulaId)
+      const nextVersion = (formula?.version ?? 1) + 1
+      await db.formulas.update(formulaId, { totalRatio: total, version: nextVersion, updatedAt: now })
+
+      const batches = await db.batches.where('formulaId').equals(formulaId).toArray()
+      const stale = batches.filter((batch) => !snapshotMatches(batch.snapshot ?? [], toWrite))
+      if (stale.length > 0) {
+        await db.batches.bulkPut(
+          stale.map((batch) => ({ ...batch, snapshotStatus: 'stale' as const, updatedAt: now }))
+        )
+      }
+    })
+    if (!options.silent) {
+      const formula = await db.formulas.get(formulaId)
+      tabBus.broadcast({
+        type: 'proportion-changed',
+        formulaId,
+        version: formula?.version ?? 1,
+        writerTabId: tabId,
+        at: now
+      })
+    }
+    return toWrite
+  }
+
   return {
     proportions,
     proportionsByFormulaMap,
@@ -261,6 +313,7 @@ export const useProportionStore = defineStore('proportion', () => {
     updateProportion,
     removeProportion,
     clearFormulaProportions,
-    reorder
+    reorder,
+    replaceProportionSet
   }
 })

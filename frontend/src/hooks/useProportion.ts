@@ -1,8 +1,9 @@
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
-import { db } from '@/utils/db'
+import { db, createId } from '@/utils/db'
 import { useProportionStore } from '@/stores/proportionStore'
 import { useFormulaStore } from '@/stores/formulaStore'
 import { useMaterialStore } from '@/stores/materialStore'
+import { useCollabStore } from '@/stores/collabStore'
 import type { Proportion, ProportionRole } from '@/types/proportion'
 import type { Material, MaterialGrade, ProcessMethod } from '@/types/material'
 import {
@@ -54,6 +55,8 @@ export interface UseProportionResult {
   checkMessage: ComputedRef<string>
   loading: Ref<boolean>
   error: Ref<string | null>
+  /** 最近一次提交是否因协同冲突被保留草稿（未入库） */
+  lastHeld: Ref<boolean>
   add: (payload: ProportionFormPayload) => Promise<Proportion>
   update: (id: string, patch: Partial<ProportionFormPayload>) => Promise<void>
   remove: (id: string) => Promise<void>
@@ -78,13 +81,23 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   const proportionStore = useProportionStore()
   const formulaStore = useFormulaStore()
   const materialStore = useMaterialStore()
+  const collabStore = useCollabStore()
 
   const loading = ref(false)
   const error = ref<string | null>(null)
+  /** 最近一次提交是否因协同冲突被保留草稿（未入库） */
+  const lastHeld = ref(false)
 
   const formulaId = computed<string | null>(() =>
     options.formulaId ? options.formulaId.value : formulaStore.currentFormulaId
   )
+
+  /** 本标签页观察到的共同祖先基线；尚无基线时退回当前行 */
+  function baseRows(): Proportion[] {
+    const stored = formulaId.value ? collabStore.baseByFormula[formulaId.value]?.rows : undefined
+    if (stored) return stored.map((row) => ({ ...row }))
+    return rows.value.map((row) => ({ ...row.proportion }))
+  }
 
   const rows = computed<ProportionRow[]>(() => {
     const id = formulaId.value
@@ -133,25 +146,38 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     void syncFormulaTotal()
   })
 
-  function nextSeq(id: string): number {
-    const list = proportionStore.proportionsByFormula(id)
-    return list.length === 0 ? 1 : Math.max(...list.map((item) => item.seq)) + 1
-  }
+  // 观察到配比变化时同步协同基线；有待处理冲突时保留共同祖先，不覆盖
+  watch(
+    [formulaId, rows] as const,
+    ([id, list]) => {
+      if (id) collabStore.noteObservation(id, list.map((row) => ({ ...row.proportion })))
+    },
+    { immediate: true }
+  )
 
   async function add(payload: ProportionFormPayload): Promise<Proportion> {
     const id = formulaId.value
     if (!id) throw new Error('请先选择香方')
     loading.value = true
     try {
-      const record = await proportionStore.createProportion({
+      const base = baseRows()
+      const now = Date.now()
+      const record: Proportion = {
+        id: createId('prop'),
         formulaId: id,
         materialId: payload.materialId,
         ratio: round(payload.ratio, 2),
         role: payload.role,
         note: payload.note.trim(),
-        seq: nextSeq(id)
-      })
-      await syncFormulaTotal()
+        seq: base.length + 1,
+        updatedAt: now
+      }
+      const ours = [...base, record]
+      const result = await collabStore.guardProportionWrite(id, ours)
+      lastHeld.value = result.held
+      if (result.held) {
+        error.value = '检测到其它标签页同时修改，已保留双方草稿，请逐项确认后入库'
+      }
       return record
     } catch (err) {
       error.value = err instanceof Error ? err.message : '新增配比失败'
@@ -164,13 +190,20 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   async function update(id: string, patch: Partial<ProportionFormPayload>): Promise<void> {
     loading.value = true
     try {
-      const next: Partial<Proportion> = {}
-      if (patch.materialId !== undefined) next.materialId = patch.materialId
-      if (patch.ratio !== undefined) next.ratio = round(patch.ratio, 2)
-      if (patch.role !== undefined) next.role = patch.role
-      if (patch.note !== undefined) next.note = patch.note.trim()
-      await proportionStore.updateProportion(id, next)
-      await syncFormulaTotal()
+      const ours = baseRows().map((row) => {
+        if (row.id !== id) return row
+        const next: Proportion = { ...row }
+        if (patch.materialId !== undefined) next.materialId = patch.materialId
+        if (patch.ratio !== undefined) next.ratio = round(patch.ratio, 2)
+        if (patch.role !== undefined) next.role = patch.role
+        if (patch.note !== undefined) next.note = patch.note.trim()
+        return next
+      })
+      const result = await collabStore.guardProportionWrite(formulaId.value as string, ours)
+      lastHeld.value = result.held
+      if (result.held) {
+        error.value = '检测到其它标签页同时修改，已保留双方草稿，请逐项确认后入库'
+      }
     } catch (err) {
       error.value = err instanceof Error ? err.message : '更新配比失败'
       throw err
@@ -180,33 +213,28 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   }
 
   async function remove(id: string): Promise<void> {
-    await proportionStore.removeProportion(id)
-    await syncFormulaTotal()
+    const ours = baseRows().filter((row) => row.id !== id)
+    const result = await collabStore.guardProportionWrite(formulaId.value as string, ours)
+    lastHeld.value = result.held
   }
 
-  async function writeRatios(ids: string[], ratios: number[]): Promise<void> {
-    const now = Date.now()
-    await db.transaction('rw', db.proportions, async () => {
-      for (let index = 0; index < ids.length; index += 1) {
-        await db.proportions.update(ids[index], { ratio: round(ratios[index] ?? 0, 2), updatedAt: now })
-      }
-    })
-  }
-
-  /** 等比缩放：按 factor 缩放全部占比后归一化到 100 并写回 */
+  /** 等比缩放：按 factor 缩放全部占比后归一化到 100 并整组提交 */
   async function rescale(factor = 1): Promise<number> {
-    const list = rows.value
-    if (list.length === 0) return 0
+    const id = formulaId.value
+    if (!id) return 0
+    const base = baseRows()
+    if (base.length === 0) return 0
     const scaled =
       factor === 1
-        ? normalizeRatios(list.map((row) => row.ratio))
-        : scaleRatios(list.map((row) => row.ratio), factor)
-    await writeRatios(
-      list.map((row) => row.proportion.id),
-      scaled
-    )
-    await syncFormulaTotal()
-    return scaled.length
+        ? normalizeRatios(base.map((row) => row.ratio))
+        : scaleRatios(base.map((row) => row.ratio), factor)
+    const ours = base.map((row, index) => ({ ...row, ratio: round(scaled[index] ?? 0, 2) }))
+    const result = await collabStore.guardProportionWrite(id, ours)
+    lastHeld.value = result.held
+    if (result.held) {
+      error.value = '检测到其它标签页同时修改，已保留双方草稿，请逐项确认后入库'
+    }
+    return ours.length
   }
 
   async function multiply(factor: number): Promise<number> {
@@ -240,8 +268,12 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
   async function clearFormula(): Promise<number> {
     const id = formulaId.value
     if (!id) return 0
-    const count = await proportionStore.clearFormulaProportions(id)
-    await syncFormulaTotal()
+    const count = baseRows().length
+    const result = await collabStore.guardProportionWrite(id, [])
+    lastHeld.value = result.held
+    if (result.held) {
+      error.value = '检测到其它标签页同时修改，已保留双方草稿，请逐项确认后入库'
+    }
     return count
   }
 
@@ -256,6 +288,7 @@ export function useProportion(options: UseProportionOptions = {}): UseProportion
     checkMessage,
     loading,
     error,
+    lastHeld,
     add,
     update,
     remove,

@@ -11,6 +11,7 @@ import {
   type ProcessMethod
 } from '@/types/material'
 import type { Proportion, ProportionRole } from '@/types/proportion'
+import { sumRatios } from '@/utils/ratio'
 
 /** 香料库一行：香料 + 被引用情况 */
 export interface MaterialRow {
@@ -187,16 +188,31 @@ export const useMaterialStore = defineStore('material', () => {
     }
   }
 
-  /** 删除香料：同时级联删除引用它的配比记录（配比合计会因此变化） */
+  /** 删除香料：同时级联删除引用它的配比记录，并把受影响配方的批次快照标记为待复核 */
   async function removeMaterial(
     id: string
   ): Promise<{ proportions: number; formulaIds: string[] }> {
     const list = proportionsByMaterial.value[id] ?? []
     const proportionIds = list.map((item) => item.id)
     const formulaIds = Array.from(new Set(list.map((item) => item.formulaId)))
-    await db.transaction('rw', [db.materials, db.proportions], async () => {
+    const now = Date.now()
+    await db.transaction('rw', [db.materials, db.proportions, db.formulas, db.batches], async () => {
       await db.proportions.bulkDelete(proportionIds)
       await db.materials.delete(id)
+      // 配比被删属于改方：受影响配方版本 +1，在用批次旧快照立即失效、标记待复核
+      for (const formulaId of formulaIds) {
+        const remaining = await db.proportions.where('formulaId').equals(formulaId).toArray()
+        const formula = await db.formulas.get(formulaId)
+        await db.formulas.update(formulaId, {
+          totalRatio: sumRatios(remaining.map((item) => item.ratio)),
+          version: (formula?.version ?? 1) + 1,
+          updatedAt: now
+        })
+        await db.batches.where('formulaId').equals(formulaId).modify({
+          snapshotStatus: 'stale' as const,
+          updatedAt: now
+        })
+      }
     })
     return { proportions: proportionIds.length, formulaIds }
   }

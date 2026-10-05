@@ -9,6 +9,7 @@ import GradeTag from '@/components/common/GradeTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useCellarStore, parseDate } from '@/stores/cellarStore'
 import { useFormulaStore } from '@/stores/formulaStore'
+import { useCollabStore } from '@/stores/collabStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useProportion } from '@/hooks/useProportion'
 import { db } from '@/utils/db'
@@ -31,6 +32,7 @@ const route = useRoute()
 const router = useRouter()
 const cellarStore = useCellarStore()
 const formulaStore = useFormulaStore()
+const collabStore = useCollabStore()
 const batchTable = useIdbTable<Batch>((database) => database.batches, { sortByUpdatedAt: false })
 const proportionTable = useIdbTable<Proportion>((database) => database.proportions, { sortByUpdatedAt: false })
 
@@ -292,13 +294,25 @@ async function submitForm(): Promise<void> {
   }
 }
 
+/** 出窖前校验：批次快照因改方待复核时拦截，复核通过后才放行 */
+async function canRelease(cellar: Cellar): Promise<boolean> {
+  const batch = batchTable.rows.value.find((item) => item.id === cellar.batchId)
+  if (!batch) return true
+  const allowed = collabStore.requireReviewed(batch)
+  if (!allowed) ElMessage.warning('批次快照待复核，复核通过前不能按新配比登记出窖')
+  return allowed
+}
+
 async function advanceState(row: CellarRow): Promise<void> {
+  // 窖藏中 → 已出窖前先校验快照，避免按新配比登记出窖
+  if (row.cellar.state === '窖藏中' && !(await canRelease(row.cellar))) return
   const next = await cellarStore.advanceState(row.cellar.id)
   if (next) ElMessage.success(`「${row.formulaName}」已流转为「${next}」`)
 }
 
 async function setState(row: CellarRow, state: CellarState): Promise<void> {
   if (row.cellar.state === state) return
+  if (state === '已出窖' && !(await canRelease(row.cellar))) return
   await cellarStore.setState(row.cellar.id, state)
   ElMessage.success(`已置为「${state}」`)
 }

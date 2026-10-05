@@ -20,7 +20,7 @@ const router = useRouter()
 const formulaStore = useFormulaStore()
 const materialStore = useMaterialStore()
 const proportionStore = useProportionStore()
-const { rows, rolePreview, total, gap, checkLevel, checkMessage, add, update, remove, rescale, sortByRole, reorder, clearFormula } =
+const { rows, rolePreview, total, gap, checkLevel, checkMessage, lastHeld, add, update, remove, rescale, sortByRole, reorder, clearFormula } =
   useProportion()
 
 const dialogVisible = ref(false)
@@ -227,10 +227,12 @@ async function submitForm(): Promise<void> {
         role: form.role,
         note: form.note
       })
-      ElMessage.success('配比已更新')
+      if (lastHeld.value) ElMessage.warning('检测到其它标签页同时修改，草稿已保留，请在冲突中心逐项确认')
+      else ElMessage.success('配比已更新')
     } else {
       await add({ materialId: form.materialId, ratio: form.ratio, role: form.role, note: form.note })
-      ElMessage.success('已加入配比，可继续调整占比')
+      if (lastHeld.value) ElMessage.warning('检测到其它标签页同时修改，草稿已保留，请在冲突中心逐项确认')
+      else ElMessage.success('已加入配比，可继续调整占比')
     }
     dialogVisible.value = false
   } finally {
@@ -242,6 +244,10 @@ async function quickRatio(row: ProportionRow, value: number): Promise<void> {
   const next = round(value, 2)
   if (next === row.ratio) return
   await update(row.proportion.id, { ratio: next })
+  if (lastHeld.value) {
+    ElMessage.warning('检测到其它标签页同时修改，草稿已保留，请在冲突中心逐项确认')
+    return
+  }
   if (next < 0 || next > 100) {
     ElMessage.warning('占比应在 0 ~ 100 之间')
     return
@@ -257,7 +263,8 @@ async function removeRow(row: ProportionRow): Promise<void> {
   ).catch(() => false)
   if (!confirmed) return
   await remove(row.proportion.id)
-  ElMessage.success('配比已移除')
+  if (lastHeld.value) ElMessage.warning('检测到其它标签页同时修改，草稿已保留，请在冲突中心逐项确认')
+  else ElMessage.success('配比已移除')
 }
 
 async function doRescale(factor: number): Promise<void> {
@@ -266,6 +273,10 @@ async function doRescale(factor: number): Promise<void> {
     return
   }
   const count = await rescale(factor)
+  if (lastHeld.value) {
+    ElMessage.warning('检测到其它标签页同时修改，草稿已保留，请在冲突中心逐项确认')
+    return
+  }
   ElMessage.success(
     factor === 1 ? `已按等比归一化 ${count} 条配比，合计校准为 100%` : `已按 ×${factor} 等比缩放 ${count} 条配比`
   )
@@ -288,7 +299,8 @@ async function clearAll(): Promise<void> {
   ).catch(() => false)
   if (!confirmed) return
   const count = await clearFormula()
-  ElMessage.success(`已清空 ${count} 条配比`)
+  if (lastHeld.value) ElMessage.warning('检测到其它标签页同时修改，草稿已保留，请在冲突中心逐项确认')
+  else ElMessage.success(`已清空 ${count} 条配比`)
 }
 
 function onDragStart(row: ProportionRow): void {

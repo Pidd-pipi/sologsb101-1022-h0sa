@@ -183,6 +183,7 @@ function parseFormula(input: unknown, errors: string[]): Formula | null {
     createdAt,
     totalRatio,
     state,
+    version: asNumber(input.version, 1),
     updatedAt: asNumber(input.updatedAt, Date.now())
   }
 }
@@ -308,6 +309,9 @@ export function validateFormulaJson(input: unknown): ValidateResult<FormulaExpor
           }))
         : [],
       snapshotAt: asNumber(raw.snapshotAt, 0),
+      snapshotVersion: asNumber(raw.snapshotVersion, 1),
+      snapshotStatus: (raw.snapshotStatus === 'stale' ? 'stale' : 'current') as 'current' | 'stale',
+      reviewedAt: typeof raw.reviewedAt === 'number' ? raw.reviewedAt : undefined,
       updatedAt: asNumber(raw.updatedAt, Date.now())
     })
   })

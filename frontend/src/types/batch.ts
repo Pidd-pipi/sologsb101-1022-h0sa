@@ -25,6 +25,14 @@ export interface Batch {
   snapshot: BatchSnapshotItem[]
   /** 快照固化时间戳 */
   snapshotAt: number
+  /** 快照对应的配方版本号（Formula.version） */
+  snapshotVersion: number
+  /** 快照状态：current=与当前配比一致；stale=改方后旧快照已失效，待复核 */
+  snapshotStatus: 'current' | 'stale'
+  /** 复核时间戳：复核通过（保留旧快照或已刷新）后写入，解除出窖 / 品香拦截 */
+  reviewedAt?: number
+  /** 复核备注：如「保留旧方」「已按新配比刷新」 */
+  reviewNote?: string
   updatedAt: number
 }
 
